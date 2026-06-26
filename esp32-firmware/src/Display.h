@@ -787,9 +787,8 @@ inline void buildHome() {
     // === 右侧: 仓重大数字 (占满右3/4, x=120..480) ===
     // 130px大数字,居中在右3/4区域; kg在下方缩小
     binWeightLabel = makeLabel(middle, "--", &lv_font_numbers_130, C(CLR_TEXT));
-    // 仓重大数字: 放大8px(138/130≈1.06, zoom=272/256) + 右移 + 下移
-    lv_obj_set_style_transform_zoom(binWeightLabel, 272, 0);
-    lv_obj_align(binWeightLabel, LV_ALIGN_TOP_MID, 75, 35);
+    // 仓重大数字: 右移 + 下移 (不加zoom避免裁剪)
+    lv_obj_align(binWeightLabel, LV_ALIGN_TOP_MID, 78, 35);
 
     kgLabel = makeLabel(middle, "kg", &lv_font_montserrat_24, C(CLR_MUTED));
     // kg在大数字下方居中
