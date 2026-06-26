@@ -279,14 +279,14 @@ inline void buildHome() {
 
     lv_obj_t* logo = lv_img_create(top);
     lv_img_set_src(logo, &logo_roastek);
-    // logo 位图原始 96x53;缩小到约 57x32,放进 56px 高顶栏,避免溢出穿模
-    lv_img_set_zoom(logo, 256 * 57 / 96);
+    // logo 原始 96x53,保持不缩放;竖直居中在56px顶栏
     lv_obj_align(logo, LV_ALIGN_LEFT_MID, 6, 0);
     lv_obj_add_flag(logo, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(logo, logoEvent, LV_EVENT_LONG_PRESSED, nullptr);
 
+    // 仓1文字右移让位给logo(logo占x=6..102,文字从x=112开始)
     roleLabel = makeLabel(top, "仓1 | 主机", &lv_font_chinese_14, C(COLOR_TEXT));
-    lv_obj_align(roleLabel, LV_ALIGN_LEFT_MID, 72, 0);
+    lv_obj_align(roleLabel, LV_ALIGN_LEFT_MID, 112, 0);
 
     lv_obj_t* dots = lv_obj_create(top);
     lv_obj_remove_style_all(dots);
