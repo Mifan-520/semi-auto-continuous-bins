@@ -166,13 +166,14 @@ inline bool EspnowMesh_Init() {
         return false;
     }
 
-    // 初始化本机仓状态: 自己在线
+    // 初始化本机仓状态: 自己在线, 通知Display
     uint8_t myIdx = (myBinId >= 1 && myBinId <= BIN_COUNT) ? myBinId - 1 : 0;
     binStates[myIdx].online = true;
     binStates[myIdx].lastHeardMs = millis();
     binStates[myIdx].binWeight = 0;
     binStates[myIdx].currentWeight = 0;
     memcpy(binStates[myIdx].mac, myMac, 6);
+    if (gOnBinStateCb) gOnBinStateCb(myBinId, true, 0, 0);
 
     Serial.println("[ESPNOW] 初始化完成 (广播模式, 无需路由器)");
     return true;

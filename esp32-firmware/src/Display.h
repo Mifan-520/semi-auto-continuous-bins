@@ -49,13 +49,13 @@ inline lv_obj_t* editKeyMatrix = nullptr;
 inline float binWeights[BIN_COUNT] = {45.0f, 30.0f, 50.0f, 20.0f, 60.0f, 35.0f};
 inline uint8_t localBin = 0;           // 本机仓号 0-5 (默认仓1)
 inline float simCurrentWeight = 25.3f;
-inline bool online = true;            // 在线状态 (M1默认在线, 后续接ESP-NOW/蓝牙心跳更新)
+inline bool online = false;           // 在线状态 (ESP-NOW初始化后设true)
 inline bool persistentError = false;
 inline uint32_t normalMessageUntil = 0;
 inline uint32_t lastSimUpdate = 0;
 
-// 6仓在线表 (只有本机仓默认在线, 其余灰色等ESP-NOW心跳)
-inline bool binOnline[BIN_COUNT] = {true, false, false, false, false, false};
+// 6仓在线表 (全部默认灰色, 上线后才变绿)
+inline bool binOnline[BIN_COUNT] = {false, false, false, false, false, false};
 
 // ===== NVS 持久化(Preferences) — 断电量还在 =====
 static constexpr const char* NVS_NS = "binweight";
@@ -670,6 +670,10 @@ inline void Display_OnBinStateChange(uint8_t binId, bool online, float binWeight
     binOnline[idx] = online;
     // 同步该仓重量(便于编辑面板等其他用途)
     if (idx != localBin) binWeights[idx] = binWeight;
+    // 本机仓状态变化→更新大圆灯
+    if (idx == localBin) {
+        ::setOnline(online);
+    }
     Serial.printf("[Display] 仓%d %s (重量%.1f)\n", binId, online ? "上线" : "离线", binWeight);
     updateBinDots();
 }
@@ -721,7 +725,7 @@ inline void buildHome() {
     // 在线/离线 大圆灯 (仓号右侧)
     connLamp = lv_obj_create(top);
     lv_obj_remove_style_all(connLamp);
-    lv_obj_set_size(connLamp, 26, 26);
+    lv_obj_set_size(connLamp, 29, 29);
     lv_obj_align(connLamp, LV_ALIGN_LEFT_MID, 148, 0);
     lv_obj_set_style_radius(connLamp, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(connLamp, LV_OPA_COVER, 0);
