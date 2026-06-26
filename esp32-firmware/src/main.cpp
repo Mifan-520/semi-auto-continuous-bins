@@ -32,11 +32,19 @@ void setup() {
     Display_Init();
 
     // 2. 初始化 ESP-NOW 组网
-    EspnowMesh_SetMyBin(DEFAULT_LOCAL_ID);
+    // Display_Init() 已从 NVS 读出本机仓号；ESP-NOW 必须使用同一个仓号，
+    // 否则会出现 UI 显示仓5、网络仍广播仓1 的错位。
+    const uint8_t localBinId = Display_GetLocalBinId();
+    EspnowMesh_SetMyBin(localBinId);
     EspnowMesh_SetGateway(DEFAULT_GATEWAY_FLAG);
     EspnowMesh_SetStateCallback(onBinStateChange);
+    EspnowMesh_SetWeightSyncCallback(Display_OnBinWeightSync);
+    EspnowMesh_SetSilenceCallback(Display_OnSilence);
     if (!EspnowMesh_Init()) {
         Serial.println("[A33E] ESP-NOW初始化失败, 仅UI运行");
+    } else {
+        // 上电后立即广播上线，不等待2秒心跳周期，避免其他仓不知道本机已恢复。
+        EspnowMesh_AnnounceOnline(Display_GetBinWeight(), Display_GetCurrentWeight(), 5, 40);
     }
 
     // 3. 蓝牙称重:等I6328A到货后取消注释 BleScale_Init/BleScale_Loop

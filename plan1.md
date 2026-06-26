@@ -1,185 +1,162 @@
-# A33E 称重小车蓝牙方案 — 总计划 (plan1.md)
+# A33E 称重小车蓝牙方案 — 总计划
 
-> 项目根目录: `C:\Users\伍米饭\Desktop\十日谈项目\esp32\溧阳二期esp32`
-> 新工程: `esp32-firmware/`
-> GitHub: `https://github.com/Mifan-520/esp32-.git`
-> 分支: `main`
-> 当前 HEAD: `5031c44`
+> 当前日期：2026-06-26  
+> GitHub：`https://github.com/Mifan-520/esp32-.git`  
+> 主工程：`esp32-firmware/`  
+> 旧工程：`esp32-master/`、`esp32-slave/` 只作为历史备份/移植参考，不再直接改旧架构。
 
----
+## 1. 当前架构
 
-## 物理链路
+物理链路目标：
 
-```
-3个称重传感器 → 三合一接线盒 → XK3190-A33E称重表头(P6=13 Modbus-RTU)
-  → RS485 → I6328A蓝牙模块(双模SPP/BLE,默认从机,点对点)
-  → 蓝牙SPP → 6块中的1块ESP32(固定网关,先连上A33E的成为MASTER)
-  → ESP-NOW(WiFi ch6 广播,无需路由器) → 其余5块ESP32
-  → 有人DTU(串口透传) → 云端
-```
+`称重传感器 → 三合一接线盒 → XK3190-A33E 表头 → RS485 → I6328A 蓝牙模块 → ESP32 集成屏 → ESP-NOW 组网 → 网关机 → DTU JSON 上云`
 
----
+当前固件已实现到：
 
-## 硬件配置
+- UI + 本机仓重编辑 + NVS 持久化
+- ESP-NOW 6 仓心跳广播、在线状态、仓重同步
+- COM3/COM4 两块 ESP32 集成屏编译、烧录、互收心跳验证
+- 蓝牙/A33E/DTU 仍是后续阶段，当前只保留接口和框架
 
-| 硬件 | 参数 |
+硬件锁定：
+
+| 项目 | 配置 |
 |---|---|
-| 屏幕 | LCDWIKI 4寸 TFT ST7796S 320×480 (rotation=1 → 480×320横屏) |
-| 触摸 | XPT2046 电阻触摸, 校准 `{275,3620,264,3532,1}` |
-| ESP32 | ESP32-WROOM-32E (非S3/S2) |
-| 烧录口 | COM3 / COM4 (CH340) |
-| TFT引脚 | CS=15, DC=2, MOSI=13, MISO=12, SCLK=14, BL=27, RST=-1 |
-| 触摸引脚 | TP_CS=33, TP_IRQ=36 |
-| DTU预留 | TX=32, RX=25 |
-| 编译环境 | VSCode + PlatformIO (espressif32@6.5.0, Arduino框架) |
-| 固件分区 | huge_app.csv |
+| 屏幕 | ST7796，横屏 480×320 |
+| TFT | CS15 / DC2 / MOSI13 / MISO12 / SCLK14 / BL27 / RST=-1 |
+| 触摸 | TP_CS33 / TP_IRQ36 |
+| 烧录口 | COM3 / COM4，CH340 |
+| ESP-NOW | WiFi STA，固定 ch6，广播 MAC |
+| 网关约束 | 1 号机固定网关 |
+| DTU 预留 | Serial1，TX=GPIO32，RX=GPIO25，默认 9600 |
 
----
+## 2. 已完成
 
-## 已完成 ✅
+### M0：老代码备份
 
-### M0: 老代码备份
-- [x] 旧 `esp32-master/` / `esp32-slave/` 提交到 GitHub
-- [x] 打标签 `v0-legacy`
-- [x] commit `37a563b`
-- **注意**: 旧代码是 CJMCU-752/BLE GATT 主从/4仓/模拟数据原型,与新方案链路不同
+- [x] 旧 `esp32-master/`、`esp32-slave/` 已作为回滚点保留
+- [x] `main` 和 `v0-legacy` 已推送 GitHub
+- [x] 当前新开发集中在 `esp32-firmware/`
 
-### M1: 统一固件工程 + UI
-- [x] `esp32-firmware/` 工程骨架 (PlatformIO + TFT_eSPI@2.5.43 + LVGL@8.4.0)
-- [x] 白底全屏 (0xFFFFFF)
-- [x] **顶栏** (高60): logo(96×53原始尺寸) + 仓号文字 + 大圆灯(29px,在线绿/离线红) + 6仓状态灯(18px,左到右1-6,在线绿/离线灰) + 编辑按钮(右上)
-- [x] **中间区分两栏**: 左1/4称重重量(montserrat_48 + 小kg) + 右3/4仓重大数字(130px + 小kg)
-- [x] **底部**: 上料完毕 + 下料完毕 两个大按钮(230×58)
-- [x] 中文仅使用字体已有字符(避免方框): 仓/在线/离线/上料完毕/下料完毕/编辑/确认/取消/修改完毕/仓重不足
-- [x] kg 在数字下方缩小(montserrat_24),不再穿模
-- [x] 上料/下料确认弹窗 → 仓重累加/扣减
-- [x] **数字键盘编辑面板**: 左6个仓按钮 + 右4×3键盘(7 8 9/4 5 6/1 2 3/. 0 ⌫) + 输入框 + 确认按钮 → 参考老版 LvglGui
-- [x] **离线警告框**: 左上角红框,只占左1/4区域,不挡仓重大数字,离线显在线隐
-- [x] 触摸诊断日志 `[Touch]` + 事件日志 `[EVENT]`
-- [x] 启动自测(SELFTEST ALL PASS): 上料累加/下料扣减/下料不足保护/报错态按钮禁用
-- [x] COM3/COM4 双板编译SUCCESS + 烧录 + 启动无报错
+### M1：统一固件工程 + UI
 
-### M3: ESP-NOW 组网
-- [x] `EspnowMesh.h` — 6台ESP32 WiFi ch6 广播组网 (无需路由器)
-- [x] 心跳包 (24B): magic(0xA33E0001) + binId + role + 体重 + 称重 + seq + MAC
-- [x] 每2秒广播一次, 10秒没收到心跳→标记离线
-- [x] MAC 过滤排除自己, 不同仓号自动发现
-- [x] 回调通知 Display 更新6仓状态灯
-- [x] 开发者模式(长按logo 4秒)选仓号联动 ESP-NOW (`EspnowMesh_OnBinChanged`)
-- [x] COM3(仓1) ↔ COM4(仓2) ESP-NOW 收发心跳验证通过
-- [x] 发送/接收日志 (每5秒打印)
+- [x] PlatformIO/Arduino 工程已建立
+- [x] 复用旧从机字体、logo、LVGL/TFT_eSPI 配置
+- [x] 首页包含：logo、仓号、大圆灯、6 仓小灯、编辑按钮、当前称重、仓重大数字、上料/下料按钮
+- [x] 中文字体已扩展，支持当前 UI 所需字符
+- [x] 上料/下料确认弹窗
+- [x] 编辑面板：数字键盘、确认修改、本仓仓重保存
+- [x] NVS 保存 6 仓重量和本机仓号，断电重启后恢复
+- [x] 离线告警框已改为黄色高亮，并采用白色覆盖块清残影
+- [x] 用户已继续微调布局；当前以代码实际布局为准
 
-### M4: 蓝牙 SPP 读 A33E (框架完成,等硬件)
-- [x] `BleScaleClient.h` — BluetoothSerial 连接 I6328A, 透传 Modbus-RTU
-- [x] Modbus CRC16 + 读寄存器8(float毛重) + 非阻塞 + 自动回退模拟
-- [x] main.cpp 中已写但**注释**(等I6328A到货取消注释)
-- [ ] **待硬件**: I6328A模块 + A33E表头到货后启动
+### M3：ESP-NOW 组网
 
-### NVS 持久化
-- [x] Preferences 库,命名空间 "binweight"
-- [x] 6仓重量 + 本机仓号 保存/加载
-- [x] 上料/下料/编辑/选仓号 时自动保存
-- [x] 断电重启数据仍在 (已验证: COM3 NVS显示 `仓重=66.1` 是上次上料保存的)
+- [x] 心跳包：`HeartbeatPacket`
+  - magic `0xA33E0001`
+  - binId
+  - role
+  - online
+  - binWeight
+  - currentWeight
+  - seq
+  - MAC
+- [x] 仓重同步包：`BinWeightSyncPacket`
+  - magic `0xA33E0002`
+  - binId
+  - weight
+- [x] ESP-NOW 广播心跳
+- [x] 排除自身 MAC
+- [x] 按仓号更新 6 个状态灯
+- [x] 长按 logo 进入开发者模式选择本机仓号
+- [x] 换仓后连发上线心跳，通知其他屏幕
+- [x] 启动后立即连发上线广播，解决断电重上电后其他仓不知道本机上线的问题
+- [x] COM3/COM4 已反复烧录验证互相收到仓号心跳
 
-### 已修复的UI问题
-- [x] 中文缺字→方框 → 改用字体已有字符
-- [x] logo穿模 → 仓1文字右移让位
-- [x] kg穿模 → 放数字下方缩小
-- [x] 消息提示栏 → 已移除,仅保留离线警告框
-- [x] 6灯默认全灰 → ESP-NOW初始化后本机才变绿
-- [x] 大圆灯 26→29px
-- [x] 仓重数字 transform_zoom 导致消失 → 去掉zoom,用原始130px
-- [x] DRAM溢出 → LVGL缓冲降至10行 + LV_MEM_SIZE 24KB + 蓝牙代码注释
-- [x] 换仓号后ESP-NOW不同步 → EspnowMesh_OnBinChanged
-- [x] 长按logo时间 → 4秒 (LV_INDEV_DEF_LONG_PRESS_TIME=4000)
+### M3 收尾：离线/恢复告警逻辑
 
----
+当前规则：
 
-## 未完成 ❌
+- 全静默/断网时显示左上角黄色离线告警
+- 收到任意有效仓心跳后，认为 ESP-NOW 通信恢复
+- 恢复后：
+  - 大圆灯转绿
+  - 按钮启用
+  - 黄色告警框隐藏
+  - 同一区域显示白色覆盖块，强制刷掉可能的屏幕残影
+- 6 个仓小灯整体右移 5px
 
-### 待用户验证 (需肉眼确认)
-- [ ] COM4 长按4秒选仓2后: COM4大圆灯变绿 + COM4第2盏灯变绿 + COM3第2盏灯也变绿
-- [ ] 编辑面板数字键盘功能正常
-- [ ] 上料/下料按钮触摸正常
-- [ ] 离线警告框(长按logo后模拟离线)显示正常
-- [ ] UI各元素位置/大小满意
+注意：
 
-### M5: 角色选举 + 故障接管
-- [ ] 多台竞争连接蓝牙读A33E (先连上的成为MASTER)
-- [ ] MASTER断连后另一台接管
-- [ ] 仓号优先级(1>2>...>6) + 随机退避
+- 若现场仍看到“告警”，需要先区分是黄色告警框残影、大圆灯红色，还是某个仓小灯灰色。
+- 如果黄色框仍残留，下一步建议改为直接在 TFT 层 `fillRect()` 清该区域，而不是只依赖 LVGL 对象覆盖。
 
-### M6: 配置页
-- [ ] 运行时设置仓号/网关/蓝牙参数
-- [ ] NVS 保存配置
-- [ ] 恢复默认值
+### M4：蓝牙 SPP 读 A33E 框架
 
-### M7: 有人DTU上云
-- [ ] DTU 串口透传 (TX=32, RX=25)
-- [ ] 固定网关(仓1)转发
-- [ ] JSON 格式上报状态变化 (哪个仓装载/卸载了多少公斤)
-- [ ] 非阻塞发送
+- [x] `BleScaleClient.h` 已有框架文件
+- [ ] I6328A 模块和 A33E 表头到位后再启用真实读取
+- [ ] 当前主循环仍使用模拟称重，蓝牙读取暂未启用
 
-### 蓝牙硬件 (等到货)
-- [ ] I6328A 模块到货 → 取消注释 BleScaleClient
-- [ ] A33E 表头接线
+## 3. 未完成
+
+### M4 剩余：真实称重
+
 - [ ] 蓝牙配对/连接 I6328A
-- [ ] 真实 Modbus 读毛重验证
+- [ ] 读取 A33E/Modbus-RTU 重量
+- [ ] 断线回退和重连策略
+- [ ] 替换当前模拟称重
 
----
+### M5：角色/网关策略
 
-## 关键文件清单
+- [ ] 1 号机固定网关规则最终落地
+- [ ] 多机接入后，明确普通节点和网关节点行为差异
+- [ ] 是否需要故障接管，后续再定
 
-| 文件 | 用途 |
+### M6：配置页
+
+- [ ] 运行时设置本机仓号
+- [ ] 设置网关标志
+- [ ] 设置蓝牙参数
+- [ ] 设置 DTU 参数
+- [ ] NVS 保存配置
+
+### M7：DTU JSON 上云
+
+- [ ] 使用 GPIO32/GPIO25 串口输出 JSON 行
+- [ ] 上报仓号、仓重、当前称重、在线状态、上料/下料事件
+- [ ] 暂不处理 DTU 联网、ACK、重试、平台协议
+
+## 4. 关键文件
+
+| 文件 | 作用 |
 |---|---|
-| `esp32-firmware/platformio.ini` | PlatformIO 项目配置 (引脚/库/编译标志) |
-| `esp32-firmware/src/main.cpp` | 主程序 (初始化/主循环/蓝牙注释位) |
-| `esp32-firmware/src/Config.h` | 全局常量 (引脚/颜色/仓号/超时) |
-| `esp32-firmware/src/Display.h` | UI 全部 (LVGL布局/事件/编辑面板/开发者模式) |
-| `esp32-firmware/src/EspnowMesh.h` | ESP-NOW 组网 (心跳广播/离线检测/换仓) |
-| `esp32-firmware/src/BleScaleClient.h` | 蓝牙读A33E (SPP+Modbus+CRC16,等硬件) |
-| `esp32-firmware/src/CloudReport.h` | DTU云上报 (JSON占位,待M7) |
-| `esp32-firmware/src/lv_font_chinese_14.c` | 中文字体 (仅含指定汉字,新增需重新生成) |
-| `esp32-firmware/src/lv_font_numbers_130.c` | 130px数字字体 (0-9 + .) |
-| `esp32-firmware/src/logo_roastek.c` | Logo 位图 (96×53, RGBA) |
-| `esp32-firmware/include/lv_conf.h` | LVGL v8.4 配置 (字体/缓冲/长按时间/btnmatrix) |
+| `esp32-firmware/src/main.cpp` | 初始化、主循环、ESP-NOW/UI/BLE 框架串联 |
+| `esp32-firmware/src/Display.h` | LVGL UI、布局、触摸、编辑面板、告警显示 |
+| `esp32-firmware/src/EspnowMesh.h` | ESP-NOW 心跳、在线表、仓重同步、离线检测 |
+| `esp32-firmware/src/BleScaleClient.h` | 蓝牙/A33E 读取框架，待硬件验证 |
+| `esp32-firmware/src/CloudReport.h` | DTU JSON 上报占位 |
+| `esp32-firmware/src/Config.h` | 屏幕、触摸、DTU、网关等常量 |
 
----
-
-## 中文字体可用字符 (lv_font_chinese_14)
-
-```
-溧阳二期称重系统当前重量库存运行中稳定实时采样从机连接上料完毕下等待操作正常测量传感器故障失败到已请先选择取消确认仓就绪太小大于撤销无法足不可有没的在线离线同步待数据已连接操作编辑修改为输入
-+ ASCII 0x20-0x7E
-```
-
-**如需新字** → 用 LVGL font converter 重新生成:
-```
---font simhei.ttf --size 24 --bpp 4 -r 0x20-0x7E --symbols <新字列表> --format lvgl
-```
-
----
-
-## 常用操作
+## 5. 当前验证命令
 
 ```bash
 # 编译
-cd esp32-firmware && pio run -e esp32dev
+pio run -d esp32-firmware
 
-# 烧录 (先确保PlatformIO CLI可用)
-pio run -e esp32dev -t upload --upload-port COM3
+# 烧录
+pio run -d esp32-firmware -t upload --upload-port COM3
+pio run -d esp32-firmware -t upload --upload-port COM4
 
 # 串口监视
-pio device monitor -p COM3 -b 115200
-
-# 提交
-cd .. && git add esp32-firmware/ && git commit -m "..." && git push
+pio device monitor -d esp32-firmware -p COM3 -b 115200
+pio device monitor -d esp32-firmware -p COM4 -b 115200
 ```
 
----
+## 6. 给下一个 AI 的注意事项
 
-## 下个对话要处理的最优先事项
-
-1. COM4 长按4秒选仓2,验证 ESP-NOW 跨仓心跳 + 灯变绿
-2. 编辑面板数字键盘功能联调
-3. 等 I6328A + A33E 到货后启动真实称重
+- 不要再改旧 `esp32-master/`、`esp32-slave/`，除非用户明确要求。
+- 当前有效工程是 `esp32-firmware/`。
+- 仓号在 UI/NVS 中是 0 基，ESP-NOW 包里是 1 基，改逻辑时必须小心。
+- `GPIO32/GPIO25` 是用户指定的 DTU 串口脚，不要换。
+- `node_modules/` 和 `nul` 不应提交。
+- 如果继续处理告警残影，优先考虑 TFT 级别清屏矩形，而不是继续堆 LVGL 隐藏逻辑。

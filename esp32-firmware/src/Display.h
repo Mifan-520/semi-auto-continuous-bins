@@ -27,6 +27,7 @@ inline lv_obj_t* root = nullptr;
 inline lv_obj_t* binLabel = nullptr;            // 仓号文字 (仓1)
 inline lv_obj_t* connLamp = nullptr;            // 在线/离线 大圆灯
 inline lv_obj_t* warnBox = nullptr;             // 离线警告框(左上角)
+inline lv_obj_t* warnCover = nullptr;           // 在线时覆盖告警残影的白色块
 inline lv_obj_t* statusDots[BIN_COUNT] = {};    // 6仓状态灯 (左到右1-6)
 inline lv_obj_t* binWeightLabel = nullptr;      // 中间130px大数字 (仓重)
 inline lv_obj_t* kgLabel = nullptr;             // 仓重 kg单位(缩小,在数字下方)
@@ -39,11 +40,11 @@ inline lv_obj_t* modal = nullptr;
 
 // ===== 编辑面板对象 =====
 inline lv_obj_t* editOverlay = nullptr;
-inline lv_obj_t* editBinBtns[BIN_COUNT] = {};
-inline int8_t editSelectedBin = 0;
 inline char editInputBuf[16] = "";
 inline lv_obj_t* editInputLabel = nullptr;
 inline lv_obj_t* editKeyMatrix = nullptr;
+inline lv_obj_t* editConfirmBox = nullptr;   // 确认修改对话框
+inline float editPendingWeight = 0;           // 待确认的新重量
 
 // ===== 业务状态 (M1模拟) =====
 inline float binWeights[BIN_COUNT] = {45.0f, 30.0f, 50.0f, 20.0f, 60.0f, 35.0f};
@@ -51,6 +52,7 @@ inline uint8_t localBin = 0;           // 本机仓号 0-5 (默认仓1)
 inline float simCurrentWeight = 25.3f;
 inline bool online = false;           // 在线状态 (ESP-NOW初始化后设true)
 inline bool persistentError = false;
+inline volatile bool commRecoverPending = false;  // ESP-NOW回调置位, Display_Loop里清告警
 inline uint32_t normalMessageUntil = 0;
 inline uint32_t lastSimUpdate = 0;
 
@@ -97,6 +99,7 @@ constexpr uint32_t CLR_TEXT = 0x222222;
 constexpr uint32_t CLR_MUTED = 0x888888;
 constexpr uint32_t CLR_GREEN = 0x33CC33;   // 在线绿
 constexpr uint32_t CLR_RED = 0xCC0000;     // 离线红/报错
+constexpr uint32_t CLR_WARN_YELLOW = 0xFFD21A; // 离线警告黄
 constexpr uint32_t CLR_GRAY = 0xCCCCCC;    // 灰灯
 constexpr uint32_t CLR_ROASTEK = 0x661E2B; // 玫瑰红(按钮)
 constexpr uint32_t CLR_BG_INPUT = 0xF3F3F3;
@@ -146,6 +149,9 @@ inline void modalCloseEvent(lv_event_t* e);
 inline void updateBinDots();
 inline void showDevBinDialog();
 inline void setOnline(bool isOnline);
+inline void showCommAlarm();
+inline void hideCommAlarm();
+inline void showEditConfirmDialog(float newWeight);
 
 // ===== 消息栏 (已移除UI, 保留接口仅作日志/离线控制) =====
 inline void showMessage(const char* text, bool error = false, bool persistent = false) {
@@ -274,7 +280,8 @@ inline void closeEditPanel() {
     editOverlay = nullptr;
     editInputLabel = nullptr;
     editKeyMatrix = nullptr;
-    for (int i = 0; i < BIN_COUNT; i++) editBinBtns[i] = nullptr;
+    editConfirmBox = nullptr;
+    editPendingWeight = 0;
 }
 
 inline void updateEditInputDisplay() {
@@ -284,19 +291,8 @@ inline void updateEditInputDisplay() {
     lv_label_set_text(editInputLabel, display);
 }
 
-inline void updateEditBinHighlight() {
-    for (int i = 0; i < BIN_COUNT; i++) {
-        if (!editBinBtns[i]) continue;
-        bool sel = (i == editSelectedBin);
-        lv_obj_set_style_bg_color(editBinBtns[i], sel ? C(CLR_ROASTEK) : C(CLR_PANEL), 0);
-        lv_obj_set_style_border_width(editBinBtns[i], sel ? 2 : 1, 0);
-        lv_obj_set_style_border_color(editBinBtns[i], sel ? C(CLR_ROASTEK) : C(CLR_GRAY), 0);
-    }
-}
-
-inline void loadBinWeightToEditInput(int8_t bin) {
-    if (bin < 0 || bin >= BIN_COUNT) return;
-    snprintf(editInputBuf, sizeof(editInputBuf), "%.1f", binWeights[bin]);
+inline void loadCurrentWeightToEditInput() {
+    snprintf(editInputBuf, sizeof(editInputBuf), "%.1f", binWeights[localBin]);
     updateEditInputDisplay();
 }
 
@@ -331,13 +327,83 @@ inline void editKeyEvent(lv_event_t* e) {
     updateEditInputDisplay();
 }
 
-inline void editBinSelectEvent(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    int idx = (int)(intptr_t)lv_event_get_user_data(e);
-    editSelectedBin = idx;
-    updateEditBinHighlight();
-    loadBinWeightToEditInput(idx);
-    Serial.printf("[EVENT] 编辑面板: 选择仓%d\n", idx + 1);
+// ===== 确认修改对话框 (编辑面板内) =====
+inline void showEditConfirmDialog(float newWeight) {
+    if (editConfirmBox || !editOverlay) return;  // 防止重复弹出
+
+    editPendingWeight = newWeight;
+
+    // 半透明遮罩 (盖在编辑面板上方)
+    lv_obj_t* mask = lv_obj_create(editOverlay);
+    lv_obj_remove_style_all(mask);
+    lv_obj_set_size(mask, lv_obj_get_width(editOverlay), lv_obj_get_height(editOverlay));
+    lv_obj_set_style_bg_color(mask, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(mask, LV_OPA_30, 0);
+    lv_obj_set_pos(mask, 0, 0);
+
+    // 确认框
+    editConfirmBox = lv_obj_create(mask);
+    lv_obj_remove_style_all(editConfirmBox);
+    lv_obj_set_size(editConfirmBox, 300, 160);
+    lv_obj_center(editConfirmBox);
+    lv_obj_set_style_bg_color(editConfirmBox, C(CLR_PANEL), 0);
+    lv_obj_set_style_border_width(editConfirmBox, 3, 0);
+    lv_obj_set_style_border_color(editConfirmBox, C(CLR_ROASTEK), 0);
+    lv_obj_set_style_radius(editConfirmBox, 12, 0);
+    lv_obj_clear_flag(editConfirmBox, LV_OBJ_FLAG_SCROLLABLE);
+
+    // 标题
+    lv_obj_t* titleLabel = makeLabel(editConfirmBox, "确认修改", &lv_font_chinese_14, C(CLR_ROASTEK));
+    lv_obj_align(titleLabel, LV_ALIGN_TOP_MID, 0, 14);
+
+    // 内容
+    char msg[40];
+    snprintf(msg, sizeof(msg), "将仓%d重量改为%.1f kg?", localBin + 1, newWeight);
+    lv_obj_t* bodyLabel = makeLabel(editConfirmBox, msg, &lv_font_chinese_14, C(CLR_TEXT));
+    lv_obj_set_width(bodyLabel, 270);
+    lv_label_set_long_mode(bodyLabel, LV_LABEL_LONG_WRAP);
+    lv_obj_align(bodyLabel, LV_ALIGN_CENTER, 0, -8);
+
+    // 取消按钮 (灰色)
+    lv_obj_t* cancelBtn = lv_btn_create(editConfirmBox);
+    lv_obj_set_size(cancelBtn, 100, 42);
+    lv_obj_set_style_radius(cancelBtn, 8, 0);
+    lv_obj_set_style_bg_color(cancelBtn, C(CLR_GRAY), 0);
+    lv_obj_set_style_shadow_width(cancelBtn, 0, 0);
+    lv_obj_align(cancelBtn, LV_ALIGN_BOTTOM_LEFT, 24, -16);
+    lv_obj_t* cancelLbl = makeLabel(cancelBtn, "取消", &lv_font_chinese_14, lv_color_white());
+    lv_obj_center(cancelLbl);
+    lv_obj_add_event_cb(cancelBtn, [](lv_event_t* e) {
+        lv_obj_t* m = lv_obj_get_parent(lv_obj_get_parent(lv_event_get_target(e)));
+        if (m) lv_obj_del(m);
+        editConfirmBox = nullptr;
+        editPendingWeight = 0;
+        Serial.println("[EVENT] 编辑面板: 取消修改");
+    }, LV_EVENT_CLICKED, nullptr);
+
+    // 确认按钮 (玫瑰红)
+    lv_obj_t* confirmBtn = lv_btn_create(editConfirmBox);
+    lv_obj_set_size(confirmBtn, 100, 42);
+    lv_obj_set_style_radius(confirmBtn, 8, 0);
+    lv_obj_set_style_bg_color(confirmBtn, C(CLR_ROASTEK), 0);
+    lv_obj_set_style_shadow_width(confirmBtn, 0, 0);
+    lv_obj_align(confirmBtn, LV_ALIGN_BOTTOM_RIGHT, -24, -16);
+    lv_obj_t* confirmLbl = makeLabel(confirmBtn, "确认", &lv_font_chinese_14, lv_color_white());
+    lv_obj_center(confirmLbl);
+    lv_obj_add_event_cb(confirmBtn, [](lv_event_t* e) {
+        float val = editPendingWeight;
+        Serial.printf("[EVENT] 编辑确认: 仓%d 设为 %.1f kg\n", localBin + 1, val);
+        binWeights[localBin] = val;
+        nvsSaveBinWeights();  // 持久化
+        updateWeights();
+        // 关闭编辑面板 + 确认框
+        closeEditPanel();
+        // 立即广播本机仓更新(心跳)
+        EspnowMesh_BroadcastHeartbeat(binWeights[localBin], simCurrentWeight);
+        // 广播仓重同步到所有设备 (为后续DTU上报铺垫)
+        EspnowMesh_BroadcastBinWeightSync(localBin + 1, val);
+        showMessage("修改完毕", false, false);
+    }, LV_EVENT_CLICKED, nullptr);
 }
 
 inline void editConfirmEvent(lv_event_t* e) {
@@ -347,22 +413,12 @@ inline void editConfirmEvent(lv_event_t* e) {
         return;
     }
     float val = atof(editInputBuf);
-    int8_t bin = editSelectedBin;
-    Serial.printf("[EVENT] 编辑确认: 仓%d 设为 %.1f kg\n", bin + 1, val);
-    binWeights[bin] = val;
-    nvsSaveBinWeights();  // 持久化
-    closeEditPanel();
-    if (bin == localBin) {
-        updateWeights();
-        // 立即广播本机仓更新(不等2秒心跳周期)
-        EspnowMesh_BroadcastHeartbeat(binWeights[localBin], simCurrentWeight);
-    }
-    showMessage("修改完毕", false, false);
+    // 弹出确认修改对话框
+    showEditConfirmDialog(val);
 }
 
 inline void openEditPanel() {
     if (editOverlay) return;
-    editSelectedBin = localBin;
     memset(editInputBuf, 0, sizeof(editInputBuf));
 
     editOverlay = lv_obj_create(lv_scr_act());
@@ -378,18 +434,20 @@ inline void openEditPanel() {
 
     lv_obj_t* panel = lv_obj_create(editOverlay);
     lv_obj_remove_style_all(panel);
-    lv_obj_set_size(panel, 460, 280);
+    lv_obj_set_size(panel, 380, 300);
     lv_obj_set_style_bg_color(panel, C(CLR_PANEL), 0);
     lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(panel, C(CLR_ROASTEK), 0);
     lv_obj_set_style_border_width(panel, 2, 0);
     lv_obj_set_style_radius(panel, 10, 0);
-    lv_obj_set_style_pad_all(panel, 6, 0);
+    lv_obj_set_style_pad_all(panel, 8, 0);
     lv_obj_center(panel);
     lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    // 标题
-    lv_obj_t* titleLabel = makeLabel(panel, "编辑仓重量", &lv_font_chinese_14, C(CLR_TEXT));
+    // 标题 (显示本机仓号)
+    char title[24];
+    snprintf(title, sizeof(title), "编辑仓%d重量", localBin + 1);
+    lv_obj_t* titleLabel = makeLabel(panel, title, &lv_font_chinese_14, C(CLR_TEXT));
     lv_obj_align(titleLabel, LV_ALIGN_TOP_LEFT, 4, 2);
 
     // 关闭按钮
@@ -408,51 +466,20 @@ inline void openEditPanel() {
         closeEditPanel();
     }, LV_EVENT_CLICKED, nullptr);
 
-    // 内容区: 左仓选择 + 右键盘
+    // 内容区: 输入框 + 键盘 + 确认 (拉伸占满)
     lv_obj_t* content = lv_obj_create(panel);
     lv_obj_remove_style_all(content);
-    lv_obj_set_size(content, 440, 244);
+    lv_obj_set_size(content, 360, 252);
     lv_obj_set_style_pad_all(content, 4, 0);
-    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_ROW);
-    lv_obj_align(content, LV_ALIGN_TOP_LEFT, 0, 24);
+    lv_obj_set_style_pad_row(content, 6, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 28);
 
-    // 左: 仓1-6
-    lv_obj_t* leftCol = lv_obj_create(content);
-    lv_obj_remove_style_all(leftCol);
-    lv_obj_set_size(leftCol, 72, 236);
-    lv_obj_set_style_pad_all(leftCol, 2, 0);
-    lv_obj_set_style_pad_row(leftCol, 2, 0);
-    lv_obj_set_flex_flow(leftCol, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(leftCol, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    for (int i = 0; i < BIN_COUNT; i++) {
-        editBinBtns[i] = lv_btn_create(leftCol);
-        lv_obj_set_size(editBinBtns[i], 64, 34);
-        lv_obj_set_style_radius(editBinBtns[i], 6, 0);
-        lv_obj_set_style_bg_color(editBinBtns[i], C(CLR_PANEL), 0);
-        lv_obj_set_style_bg_opa(editBinBtns[i], LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(editBinBtns[i], 1, 0);
-        lv_obj_set_style_border_color(editBinBtns[i], C(CLR_GRAY), 0);
-        lv_obj_set_style_shadow_width(editBinBtns[i], 0, 0);
-        lv_obj_add_event_cb(editBinBtns[i], editBinSelectEvent, LV_EVENT_CLICKED, (void*)(intptr_t)i);
-        char bn[8];
-        snprintf(bn, sizeof(bn), "仓%d", i + 1);
-        lv_obj_t* bLbl = makeLabel(editBinBtns[i], bn, &lv_font_chinese_14, C(CLR_TEXT));
-        lv_obj_center(bLbl);
-    }
-
-    // 右: 输入框 + 键盘 + 确认
-    lv_obj_t* rightCol = lv_obj_create(content);
-    lv_obj_remove_style_all(rightCol);
-    lv_obj_set_size(rightCol, 356, 236);
-    lv_obj_set_style_pad_all(rightCol, 4, 0);
-    lv_obj_set_style_pad_row(rightCol, 4, 0);
-    lv_obj_set_flex_flow(rightCol, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(rightCol, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t* inputBox = lv_obj_create(rightCol);
+    // 输入框 (拉伸占满宽度)
+    lv_obj_t* inputBox = lv_obj_create(content);
     lv_obj_remove_style_all(inputBox);
-    lv_obj_set_size(inputBox, 340, 36);
+    lv_obj_set_size(inputBox, 348, 40);
     lv_obj_set_style_bg_color(inputBox, C(CLR_BG_INPUT), 0);
     lv_obj_set_style_bg_opa(inputBox, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(inputBox, 6, 0);
@@ -462,8 +489,9 @@ inline void openEditPanel() {
     editInputLabel = makeLabel(inputBox, "0 kg", &lv_font_chinese_14, C(CLR_TEXT));
     lv_obj_align(editInputLabel, LV_ALIGN_RIGHT_MID, -8, 0);
 
-    editKeyMatrix = lv_btnmatrix_create(rightCol);
-    lv_obj_set_size(editKeyMatrix, 340, 120);
+    // 键盘 (拉伸占满宽度)
+    editKeyMatrix = lv_btnmatrix_create(content);
+    lv_obj_set_size(editKeyMatrix, 348, 144);
     lv_btnmatrix_set_map(editKeyMatrix, kbMap);
     lv_obj_set_style_bg_color(editKeyMatrix, C(CLR_PANEL), 0);
     lv_obj_set_style_bg_opa(editKeyMatrix, LV_OPA_COVER, 0);
@@ -482,8 +510,9 @@ inline void openEditPanel() {
     lv_obj_set_style_text_color(editKeyMatrix, lv_color_white(), LV_PART_ITEMS | LV_STATE_PRESSED);
     lv_obj_add_event_cb(editKeyMatrix, editKeyEvent, LV_EVENT_VALUE_CHANGED, nullptr);
 
-    lv_obj_t* editConfirmBtn = lv_btn_create(rightCol);
-    lv_obj_set_size(editConfirmBtn, 340, 36);
+    // 确认按钮 (拉伸占满宽度)
+    lv_obj_t* editConfirmBtn = lv_btn_create(content);
+    lv_obj_set_size(editConfirmBtn, 348, 40);
     lv_obj_set_style_radius(editConfirmBtn, 6, 0);
     lv_obj_set_style_bg_color(editConfirmBtn, C(CLR_ROASTEK), 0);
     lv_obj_set_style_bg_opa(editConfirmBtn, LV_OPA_COVER, 0);
@@ -493,8 +522,7 @@ inline void openEditPanel() {
     lv_obj_center(ecLbl);
     lv_obj_add_event_cb(editConfirmBtn, editConfirmEvent, LV_EVENT_CLICKED, nullptr);
 
-    updateEditBinHighlight();
-    loadBinWeightToEditInput(editSelectedBin);
+    loadCurrentWeightToEditInput();
     Serial.println("[EVENT] 编辑面板已打开");
 }
 
@@ -516,8 +544,8 @@ inline void devBinSelectEvent(lv_event_t* e) {
     uint8_t oldBin = localBin;
     localBin = idx;
     Serial.printf("[EVENT] 开发者模式: 本机仓号 仓%d → 仓%d\n", oldBin + 1, idx + 1);
-    // ESP-NOW: 旧仓下线 + 新仓上线(自动通知Display更新灯)
-    EspnowMesh_OnBinChanged(oldBin + 1, idx + 1);
+    // ESP-NOW: 旧仓下线 + 新仓上线(自动通知Display更新灯) + 连发3次心跳
+    EspnowMesh_OnBinChanged(oldBin + 1, idx + 1, binWeights[idx], simCurrentWeight);
     closeModal();
     // 更新顶栏仓号文字
     char binTitle[8];
@@ -637,14 +665,24 @@ inline void updateWeights() {
 inline void setOnline(bool isOnline) {
     online = isOnline;
     updateConnLamp();
-    if (warnBox) {
-        if (online) lv_obj_add_flag(warnBox, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_clear_flag(warnBox, LV_OBJ_FLAG_HIDDEN);
-    }
     if (online) {
         setButtonsEnabled(true);
     } else {
         setButtonsEnabled(false);
+    }
+}
+
+inline void showCommAlarm() {
+    if (warnBox) lv_obj_clear_flag(warnBox, LV_OBJ_FLAG_HIDDEN);
+    if (warnCover) lv_obj_add_flag(warnCover, LV_OBJ_FLAG_HIDDEN);
+}
+
+inline void hideCommAlarm() {
+    if (warnBox) lv_obj_add_flag(warnBox, LV_OBJ_FLAG_HIDDEN);
+    if (warnCover) {
+        lv_obj_clear_flag(warnCover, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(warnCover);
+        lv_obj_invalidate(warnCover);
     }
 }
 
@@ -663,21 +701,65 @@ inline void updateConnLamp() {
 // ===== 外部访问接口 (供main调用) =====
 inline float Display_GetBinWeight() { return binWeights[localBin]; }
 inline float Display_GetCurrentWeight() { return simCurrentWeight; }
+inline uint8_t Display_GetLocalBinId() { return localBin + 1; }
 inline void Display_SetCurrentWeight(float w) { simCurrentWeight = w; updateWeights(); }
 
 // ESP-NOW 收到某仓状态变化 → 更新对应灯 + binOnline数组
-inline void Display_OnBinStateChange(uint8_t binId, bool online, float binWeight, float currentWeight) {
+inline void Display_OnBinStateChange(uint8_t binId, bool isBinOnline, float binWeight, float currentWeight) {
     if (binId < 1 || binId > BIN_COUNT) return;
     uint8_t idx = binId - 1;
-    binOnline[idx] = online;
+    binOnline[idx] = isBinOnline;
     // 同步该仓重量(便于编辑面板等其他用途)
     if (idx != localBin) binWeights[idx] = binWeight;
-    // 本机仓状态变化→更新大圆灯
-    if (idx == localBin) {
-        ::setOnline(online);
+
+    // 通信告警按“有没有收到有效在线心跳”判断：
+    // 收到任意仓上线，都说明 ESP-NOW 通信已恢复，必须立刻隐藏左上告警并把大灯转绿。
+    if (isBinOnline) {
+        persistentError = false;
+        ::online = true;
+        commRecoverPending = true;
+    } else if (idx == localBin) {
+        // 只有本机仓被明确置离线时，才把大灯转红；远端单仓离线只影响6仓小灯。
+        persistentError = true;
+        ::online = false;
+        ::setOnline(false);
+        showCommAlarm();
     }
-    Serial.printf("[Display] 仓%d %s (重量%.1f)\n", binId, online ? "上线" : "离线", binWeight);
+    Serial.printf("[Display] 仓%d %s (重量%.1f)\n", binId, isBinOnline ? "上线" : "离线", binWeight);
     updateBinDots();
+}
+
+// ESP-NOW 收到仓重同步包 → 更新本地仓重
+inline void Display_OnBinWeightSync(uint8_t binId, float weight) {
+    if (binId < 1 || binId > BIN_COUNT) return;
+    uint8_t idx = binId - 1;
+    binWeights[idx] = weight;
+    nvsSaveBinWeights();
+    if (idx == localBin) updateWeights();
+    Serial.printf("[Display] 仓%d 重量同步: %.1f kg\n", binId, weight);
+}
+
+// ESP-NOW 全静默状态变化 (断网/恢复)
+// 断网: 大灯变红 + 6个状态灯全灰 + 禁用按钮
+// 恢复: 恢复正常 (后续心跳会重新点亮各仓)
+inline void Display_OnSilence(bool silent) {
+    Serial.printf("[Display] 全静默: %s\n", silent ? "断网" : "恢复");
+    if (silent) {
+        persistentError = true;
+        // 大灯红 + 禁用按钮
+        setOnline(false);
+        showCommAlarm();
+        // 6个状态灯全灰
+        for (uint8_t i = 0; i < BIN_COUNT; ++i) binOnline[i] = false;
+        updateBinDots();
+    } else {
+        persistentError = false;
+        commRecoverPending = true;
+        if (localBin < BIN_COUNT) binOnline[localBin] = true;
+        setOnline(true);
+        hideCommAlarm();
+        updateBinDots();
+    }
 }
 
 // ===== 更新6仓状态灯 =====
@@ -738,7 +820,7 @@ inline void buildHome() {
     lv_obj_t* dots = lv_obj_create(top);
     lv_obj_remove_style_all(dots);
     lv_obj_set_size(dots, 168, 26);
-    lv_obj_align(dots, LV_ALIGN_LEFT_MID, 188, 0);
+    lv_obj_align(dots, LV_ALIGN_LEFT_MID, 208, 0);
     lv_obj_set_style_bg_opa(dots, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(dots, 0, 0);
     lv_obj_set_flex_flow(dots, LV_FLEX_FLOW_ROW);
@@ -768,19 +850,31 @@ inline void buildHome() {
     lv_obj_set_style_bg_opa(middle, LV_OPA_COVER, 0);
     lv_obj_clear_flag(middle, LV_OBJ_FLAG_SCROLLABLE);
 
-    // 离线警告框 (左上角,只占左1/4区域,默认隐藏,离线时显示)
+    // 离线警告框 (左上角向右延伸, 默认隐藏, 离线时显示)
     warnBox = lv_obj_create(middle);
     lv_obj_remove_style_all(warnBox);
-    lv_obj_set_size(warnBox, 116, 56);
+    lv_obj_set_size(warnBox, 170, 74);
     lv_obj_align(warnBox, LV_ALIGN_TOP_LEFT, 2, 2);
-    lv_obj_set_style_bg_color(warnBox, C(CLR_RED), 0);
+    lv_obj_set_style_bg_color(warnBox, C(CLR_WARN_YELLOW), 0);
     lv_obj_set_style_bg_opa(warnBox, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(warnBox, 6, 0);
+    lv_obj_set_style_radius(warnBox, 8, 0);
+    lv_obj_set_style_border_width(warnBox, 4, 0);
+    lv_obj_set_style_border_color(warnBox, C(CLR_RED), 0);
     lv_obj_clear_flag(warnBox, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(warnBox, LV_OBJ_FLAG_HIDDEN);  // 默认隐藏
-    lv_obj_t* warnLbl = makeLabel(warnBox, "!\n离线", &lv_font_chinese_14, lv_color_white());
+    lv_obj_t* warnLbl = makeLabel(warnBox, "!\n离线", &lv_font_chinese_14, C(CLR_RED));
     lv_obj_set_style_text_align(warnLbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_center(warnLbl);
+
+    // 在线时不只隐藏告警框，还用白色块覆盖同一区域，强制刷新掉可能的屏幕残影。
+    warnCover = lv_obj_create(middle);
+    lv_obj_remove_style_all(warnCover);
+    lv_obj_set_size(warnCover, 170, 74);
+    lv_obj_align(warnCover, LV_ALIGN_TOP_LEFT, 2, 2);
+    lv_obj_set_style_bg_color(warnCover, C(CLR_WHITE), 0);
+    lv_obj_set_style_bg_opa(warnCover, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(warnCover, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(warnCover);
 
     // === 左侧: 称重重量 (占满左1/4, 宽120) 居中显示 ===
     curWeightLabel = makeLabel(middle, "--", &lv_font_montserrat_48, C(CLR_TEXT));
@@ -869,10 +963,37 @@ inline void Display_Init() {
 
     nvsLoadBinWeights();  // 恢复上次断电前的数据
     buildHome();
+    EspnowMesh_SetWeightSyncCallback(Display_OnBinWeightSync);  // 注册仓重同步回调
+    EspnowMesh_SetSilenceCallback(Display_OnSilence);           // 注册全静默回调
     Serial.println("[Display] M1 unified UI initialized");
 }
 
 inline void Display_Loop() {
+    bool anyBinOnline = false;
+    for (uint8_t i = 0; i < BIN_COUNT; ++i) {
+        if (binOnline[i]) {
+            anyBinOnline = true;
+            break;
+        }
+    }
+
+    if (commRecoverPending || anyBinOnline) {
+        commRecoverPending = false;
+        persistentError = false;
+        setOnline(true);
+        hideCommAlarm();
+        updateBinDots();
+        static uint32_t lastRecoverLogMs = 0;
+        if (millis() - lastRecoverLogMs > 3000) {
+            lastRecoverLogMs = millis();
+            Serial.println("[Display] 通信恢复: 已隐藏离线告警");
+        }
+    }
+    // 兜底：通信/在线状态已恢复时，任何残留的黄色告警框都必须被压掉。
+    // 告警框只允许 showCommAlarm() 主动显示，不再跟普通灯状态混在一起。
+    if ((online || anyBinOnline) && warnBox) {
+        lv_obj_add_flag(warnBox, LV_OBJ_FLAG_HIDDEN);
+    }
     lv_timer_handler();
 }
 
