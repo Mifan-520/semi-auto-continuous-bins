@@ -6,6 +6,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <Preferences.h>
 #include "Config.h"
 #include "EspnowMesh.h"
 
@@ -15,7 +16,7 @@ LV_IMG_DECLARE(logo_roastek);
 
 inline TFT_eSPI tft = TFT_eSPI();
 inline lv_disp_draw_buf_t drawBuf;
-inline lv_color_t lvBuf1[SCREEN_WIDTH * 20];
+inline lv_color_t lvBuf1[SCREEN_WIDTH * 10];
 inline lv_disp_drv_t dispDrv;
 inline lv_indev_drv_t indevDrv;
 
@@ -53,8 +54,40 @@ inline bool persistentError = false;
 inline uint32_t normalMessageUntil = 0;
 inline uint32_t lastSimUpdate = 0;
 
-// 6仓在线表 (M1模拟: 随机几个在线)
-inline bool binOnline[BIN_COUNT] = {true, false, true, true, false, false};
+// 6仓在线表 (只有本机仓默认在线, 其余灰色等ESP-NOW心跳)
+inline bool binOnline[BIN_COUNT] = {true, false, false, false, false, false};
+
+// ===== NVS 持久化(Preferences) — 断电量还在 =====
+static constexpr const char* NVS_NS = "binweight";
+
+inline void nvsSaveBinWeights() {
+    Preferences prefs;
+    prefs.begin(NVS_NS, false);
+    for (int i = 0; i < BIN_COUNT; ++i) {
+        char key[8];
+        snprintf(key, sizeof(key), "bw%d", i);
+        prefs.putFloat(key, binWeights[i]);
+    }
+    prefs.putUChar("localBin", localBin);
+    prefs.end();
+    Serial.println("[NVS] 仓重已保存");
+}
+
+inline void nvsLoadBinWeights() {
+    Preferences prefs;
+    prefs.begin(NVS_NS, true);
+    for (int i = 0; i < BIN_COUNT; ++i) {
+        char key[8];
+        snprintf(key, sizeof(key), "bw%d", i);
+        binWeights[i] = prefs.getFloat(key, binWeights[i]);  // 若无记录则保留默认值
+    }
+    localBin = prefs.getUChar("localBin", localBin);
+    prefs.end();
+    Serial.printf("[NVS] 已加载: 本机=仓%d, 仓重=%.1f/%.1f/%.1f/%.1f/%.1f/%.1f\n",
+                  localBin + 1,
+                  binWeights[0], binWeights[1], binWeights[2],
+                  binWeights[3], binWeights[4], binWeights[5]);
+}
 
 // ===== 颜色 =====
 inline lv_color_t C(uint32_t hex) { return lv_color_hex(hex); }
@@ -181,6 +214,8 @@ inline void confirmEvent(lv_event_t* e) {
         binWeights[b] += simCurrentWeight;
         Serial.printf("[EVENT] 上料确认: 仓%d %.1f += %.1f => %.1f\n",
                       b + 1, binWeights[b] - simCurrentWeight, simCurrentWeight, binWeights[b]);
+        nvsSaveBinWeights();
+        updateWeights();
         showMessage("上料完毕", false, false);
     } else if (op && strcmp(op, "unload") == 0) {
         if (binWeights[b] < simCurrentWeight) {
@@ -190,6 +225,8 @@ inline void confirmEvent(lv_event_t* e) {
             Serial.printf("[EVENT] 下料确认: 仓%d %.1f -= %.1f => %.1f\n",
                           b + 1, binWeights[b] + simCurrentWeight, simCurrentWeight, binWeights[b]);
             binWeights[b] -= simCurrentWeight;
+            nvsSaveBinWeights();
+            updateWeights();
             showMessage("下料完毕", false, false);
         }
     }
@@ -313,8 +350,13 @@ inline void editConfirmEvent(lv_event_t* e) {
     int8_t bin = editSelectedBin;
     Serial.printf("[EVENT] 编辑确认: 仓%d 设为 %.1f kg\n", bin + 1, val);
     binWeights[bin] = val;
+    nvsSaveBinWeights();  // 持久化
     closeEditPanel();
-    if (bin == localBin) updateWeights();
+    if (bin == localBin) {
+        updateWeights();
+        // 立即广播本机仓更新(不等2秒心跳周期)
+        EspnowMesh_BroadcastHeartbeat(binWeights[localBin], simCurrentWeight);
+    }
     showMessage("修改完毕", false, false);
 }
 
@@ -482,6 +524,8 @@ inline void devBinSelectEvent(lv_event_t* e) {
     lv_label_set_text(binLabel, binTitle);
     updateBinDots();
     updateWeights();
+    nvsSaveBinWeights();  // 仓号持久化
+    Serial.printf("[NVS] 本机仓号已保存: 仓%d\n", localBin + 1);
 }
 
 inline void showDevBinDialog() {
@@ -617,6 +661,7 @@ inline void updateConnLamp() {
 // ===== 外部访问接口 (供main调用) =====
 inline float Display_GetBinWeight() { return binWeights[localBin]; }
 inline float Display_GetCurrentWeight() { return simCurrentWeight; }
+inline void Display_SetCurrentWeight(float w) { simCurrentWeight = w; updateWeights(); }
 
 // ESP-NOW 收到某仓状态变化 → 更新对应灯 + binOnline数组
 inline void Display_OnBinStateChange(uint8_t binId, bool online, float binWeight, float currentWeight) {
@@ -742,8 +787,9 @@ inline void buildHome() {
     // === 右侧: 仓重大数字 (占满右3/4, x=120..480) ===
     // 130px大数字,居中在右3/4区域; kg在下方缩小
     binWeightLabel = makeLabel(middle, "--", &lv_font_numbers_130, C(CLR_TEXT));
-    // 仓重数字下移
-    lv_obj_align(binWeightLabel, LV_ALIGN_TOP_MID, 60, 28);
+    // 仓重大数字: 放大8px(138/130≈1.06, zoom=272/256) + 右移 + 下移
+    lv_obj_set_style_transform_zoom(binWeightLabel, 272, 0);
+    lv_obj_align(binWeightLabel, LV_ALIGN_TOP_MID, 75, 35);
 
     kgLabel = makeLabel(middle, "kg", &lv_font_montserrat_24, C(CLR_MUTED));
     // kg在大数字下方居中
@@ -803,7 +849,7 @@ inline void Display_Init() {
     tft.setTouch(touchCalData);
 
     lv_init();
-    lv_disp_draw_buf_init(&drawBuf, lvBuf1, nullptr, SCREEN_WIDTH * 20);
+    lv_disp_draw_buf_init(&drawBuf, lvBuf1, nullptr, SCREEN_WIDTH * 10);
     lv_disp_drv_init(&dispDrv);
     dispDrv.hor_res = SCREEN_WIDTH;
     dispDrv.ver_res = SCREEN_HEIGHT;
@@ -816,19 +862,13 @@ inline void Display_Init() {
     indevDrv.read_cb = touchRead;
     lv_indev_drv_register(&indevDrv);
 
+    nvsLoadBinWeights();  // 恢复上次断电前的数据
     buildHome();
     Serial.println("[Display] M1 unified UI initialized");
 }
 
 inline void Display_Loop() {
-    const uint32_t now = millis();
     lv_timer_handler();
-
-    if (now - lastSimUpdate >= SIM_UPDATE_MS) {
-        lastSimUpdate = now;
-        simCurrentWeight = 25.0f + 4.0f * sinf(now / 1600.0f);
-        updateWeights();
-    }
 }
 
 // ===== 启动自测 =====

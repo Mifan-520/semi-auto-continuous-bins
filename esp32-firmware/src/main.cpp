@@ -2,24 +2,23 @@
 #include "Config.h"
 #include "CloudReport.h"
 #include "EspnowMesh.h"
+// #include "BleScaleClient.h"  // 等I6328A模块到货再启用
 #include "Display.h"
 
 static uint32_t lastLvTick = 0;
 static bool selfTestDone = false;
+static float simFallbackWeight = 25.3f;  // 蓝牙未连接时的模拟重量
 
 // ESP-NOW 收到某仓状态变化 → 通知Display更新对应灯
 void onBinStateChange(uint8_t binId, bool online, float binWeight, float currentWeight) {
     Display_OnBinStateChange(binId, online, binWeight, currentWeight);
 }
 
-// 开发者模式选仓号后 → 同步到ESP-NOW
-void Display_OnDevBinSelected(uint8_t binId);
-
 void setup() {
     Serial.begin(115200);
     delay(200);
     Serial.println();
-    Serial.println("[A33E] Unified firmware - UI + ESP-NOW mesh");
+    Serial.println("[A33E] Unified firmware - UI + ESP-NOW mesh + BLE Scale");
     Serial.printf("[A33E] localId=%u gateway=%s fixedGateway=%u\n",
                   DEFAULT_LOCAL_ID,
                   DEFAULT_GATEWAY_FLAG ? "true" : "false",
@@ -29,7 +28,7 @@ void setup() {
                   DTU_RX_PIN,
                   static_cast<unsigned long>(DTU_BAUD_DEFAULT));
 
-    // 1. 先初始化显示
+    // 1. 初始化显示
     Display_Init();
 
     // 2. 初始化 ESP-NOW 组网
@@ -39,6 +38,8 @@ void setup() {
     if (!EspnowMesh_Init()) {
         Serial.println("[A33E] ESP-NOW初始化失败, 仅UI运行");
     }
+
+    // 3. 蓝牙称重:等I6328A到货后取消注释 BleScale_Init/BleScale_Loop
 
     lastLvTick = millis();
 }
@@ -51,11 +52,24 @@ void loop() {
         lastLvTick = now;
     }
 
-    // 启动后跑一次业务逻辑自测
+    // 启动自测 (一次)
     if (!selfTestDone && now > 1500) {
         Display_SelfTest();
         selfTestDone = true;
     }
+
+    // 模拟称重更新 (200ms间隔, 正弦波动)
+    if (now - lastSimUpdate >= SIM_UPDATE_MS) {
+        lastSimUpdate = now;
+        simFallbackWeight = 25.0f + 4.0f * sinf(now / 1600.0f);
+    }
+
+    // 蓝牙读真实重量 (优先), 断连时回退到 simFallbackWeight
+    // 等I6328A到货: float currentWeight = BleScale_Loop(simFallbackWeight);
+    float currentWeight = simFallbackWeight;
+
+    // 更新 Display 当前称重
+    Display_SetCurrentWeight(currentWeight);
 
     // 显示循环
     Display_Loop();

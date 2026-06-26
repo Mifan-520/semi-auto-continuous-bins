@@ -9,7 +9,7 @@
 #define LV_COLOR_16_SWAP 0
 
 #define LV_MEM_CUSTOM 0
-#define LV_MEM_SIZE (32U * 1024U)
+#define LV_MEM_SIZE (24U * 1024U)
 #define LV_MEM_BUF_MAX_NUM 16
 
 #define LV_DISP_DEF_REFR_PERIOD 30
@@ -82,6 +82,7 @@
 #define LV_THEME_DEFAULT_TRANSITION_TIME 80
 
 #define LV_USE_FLEX 1
+#define LV_USE_TRANSFORM 1
 #define LV_USE_GRID 0
 
 #define LV_USE_FS_STDIO 0
