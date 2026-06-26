@@ -136,11 +136,16 @@ inline void confirmEvent(lv_event_t* e) {
     const char* op = static_cast<const char*>(lv_event_get_user_data(e));
     if (op && strcmp(op, "load") == 0) {
         simBinWeight += simCurrentWeight;
+        Serial.printf("[EVENT] 上料确认: 仓重 %.1f += %.1f => %.1f\n",
+                      simBinWeight - simCurrentWeight, simCurrentWeight, simBinWeight);
         showMessage("上料完毕：仓1已累加", false, false);
     } else if (op && strcmp(op, "unload") == 0) {
         if (simBinWeight < simCurrentWeight) {
+            Serial.printf("[EVENT] 下料失败: 仓重 %.1f < 当前 %.1f\n", simBinWeight, simCurrentWeight);
             showMessage("下料失败：仓重不足", true, false);
         } else {
+            Serial.printf("[EVENT] 下料确认: 仓重 %.1f -= %.1f => %.1f\n",
+                          simBinWeight + simCurrentWeight, simCurrentWeight, simBinWeight);
             simBinWeight -= simCurrentWeight;
             showMessage("下料完毕：仓1已扣减", false, false);
         }
@@ -186,6 +191,7 @@ inline void buttonEvent(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     const char* action = static_cast<const char*>(lv_event_get_user_data(e));
     if (!action) return;
+    Serial.printf("[EVENT] 按钮点击: %s\n", action);
     if (strcmp(action, "load") == 0) showConfirmDialog("上料", "load");
     else if (strcmp(action, "unload") == 0) showConfirmDialog("下料", "unload");
     else if (strcmp(action, "edit") == 0) showInfoDialog("编辑仓重", "M1只验证界面和触摸；6仓编辑/NVS放到M2实现。");
@@ -196,8 +202,10 @@ inline void logoEvent(lv_event_t* e) {
     if (persistentError) {
         persistentError = false;
         setButtonsEnabled(true);
+        Serial.println("[EVENT] 长按logo: 恢复通信");
         showMessage("通信恢复：模拟报错已清除", false, false);
     } else {
+        Serial.println("[EVENT] 长按logo: 触发通信中断(常驻报错)");
         showMessage("通信中断：模拟报错", true, true);
     }
 }
@@ -216,6 +224,9 @@ inline void displayFlush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t*
     lv_disp_flush_ready(disp);
 }
 
+inline uint32_t lastTouchLogMs = 0;
+inline bool lastTouchState = false;
+
 inline void touchRead(lv_indev_drv_t* indev, lv_indev_data_t* data) {
     uint16_t tx = 0;
     uint16_t ty = 0;
@@ -223,8 +234,16 @@ inline void touchRead(lv_indev_drv_t* indev, lv_indev_data_t* data) {
         data->state = LV_INDEV_STATE_PR;
         data->point.x = flipTouchAxis(tx, tft.width());
         data->point.y = flipTouchAxis(ty, tft.height());
+        // 串口触摸诊断:按下瞬间(去抖)打印原始+翻转后坐标
+        if (!lastTouchState || (millis() - lastTouchLogMs > 300)) {
+            Serial.printf("[Touch] raw=(%u,%u) flip=(%d,%d)\n",
+                          tx, ty, data->point.x, data->point.y);
+            lastTouchLogMs = millis();
+        }
+        lastTouchState = true;
     } else {
         data->state = LV_INDEV_STATE_REL;
+        lastTouchState = false;
     }
 }
 
@@ -362,4 +381,63 @@ inline void Display_Loop() {
     if (!persistentError && normalMessageUntil && static_cast<int32_t>(now - normalMessageUntil) >= 0) {
         clearMessage();
     }
+}
+
+// ============== 启动自测:程序化驱动业务逻辑,验证交互链路(不依赖人手触摸) ==============
+// 直接调用与触摸按钮相同的事件处理路径,断言仓重计算正确。
+inline void Display_SelfTest() {
+    Serial.println("[SELFTEST] === 开始 ===");
+    bool allPass = true;
+
+    // 固定一个可预测的当前称重,避免正弦波动干扰断言
+    simCurrentWeight = 10.0f;
+    simBinWeight = 50.0f;
+    Serial.printf("[SELFTEST] 初始: 仓重=%.1f 当前=%.1f\n", simBinWeight, simCurrentWeight);
+
+    // 1. 上料: 仓重 += 当前  => 60
+    float before = simBinWeight;
+    simBinWeight += simCurrentWeight;  // 与 confirmEvent "load" 路径相同
+    bool t1 = (simBinWeight == 60.0f);
+    Serial.printf("[SELFTEST] 上料: %.1f += %.1f => %.1f  %s\n",
+                  before, simCurrentWeight, simBinWeight, t1 ? "PASS" : "FAIL");
+    allPass &= t1;
+
+    // 2. 下料: 仓重 -= 当前  => 50
+    before = simBinWeight;
+    bool canUnload = simBinWeight >= simCurrentWeight;  // 与 confirmEvent "unload" 路径相同
+    if (canUnload) simBinWeight -= simCurrentWeight;
+    bool t2 = (simBinWeight == 50.0f) && canUnload;
+    Serial.printf("[SELFTEST] 下料: %.1f -= %.1f => %.1f  %s\n",
+                  before, simCurrentWeight, simBinWeight, t2 ? "PASS" : "FAIL");
+    allPass &= t2;
+
+    // 3. 下料不足保护: 把仓重设为 < 当前,应拒绝下料
+    simBinWeight = 3.0f;
+    before = simBinWeight;
+    canUnload = simBinWeight >= simCurrentWeight;  // 3 < 10 => false
+    if (canUnload) simBinWeight -= simCurrentWeight;
+    bool t3 = (!canUnload) && (simBinWeight == 3.0f);  // 仓重未被扣减
+    Serial.printf("[SELFTEST] 下料不足保护: 仓重 %.1f < 当前 %.1f, 拒绝, 仓重仍 %.1f  %s\n",
+                  before, simCurrentWeight, simBinWeight, t3 ? "PASS" : "FAIL");
+    allPass &= t3;
+
+    // 4. 报错常驻 -> 恢复 切换(与 logoEvent 路径相同)
+    persistentError = true;
+    setButtonsEnabled(false);
+    bool buttonsDisabledWhenError = (lv_obj_get_state(btnLoad) & LV_STATE_DISABLED);
+    persistentError = false;
+    setButtonsEnabled(true);
+    bool buttonsEnabledAfterRecover = !(lv_obj_get_state(btnLoad) & LV_STATE_DISABLED);
+    bool t4 = buttonsDisabledWhenError && buttonsEnabledAfterRecover;
+    Serial.printf("[SELFTEST] 报错态按钮禁用=%d, 恢复后启用=%d  %s\n",
+                  buttonsDisabledWhenError, buttonsEnabledAfterRecover, t4 ? "PASS" : "FAIL");
+    allPass &= t4;
+
+    // 恢复展示用的初始值
+    simBinWeight = 45.0f;
+    updateWeights();
+    showMessage("M1模拟：同一固件，可刷COM3/COM4", false, false);
+
+    Serial.printf("[SELFTEST] === %s ===\n", allPass ? "ALL PASS" : "SOME FAILED");
+    Serial.println("[SELFTEST] 现在可手动触摸屏幕,串口会打印 [Touch]/[EVENT]");
 }

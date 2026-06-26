@@ -4,6 +4,7 @@
 #include "Display.h"
 
 static uint32_t lastLvTick = 0;
+static bool selfTestDone = false;
 
 void setup() {
     Serial.begin(115200);
@@ -29,6 +30,12 @@ void loop() {
     if (elapsed >= UI_TICK_MS) {
         lv_tick_inc(elapsed);
         lastLvTick = now;
+    }
+
+    // 启动后等 LVGL 刷几帧,再跑一次业务逻辑自测
+    if (!selfTestDone && now > 1500) {
+        Display_SelfTest();
+        selfTestDone = true;
     }
 
     Display_Loop();
