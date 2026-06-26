@@ -24,12 +24,12 @@ inline uint16_t touchCalData[5] = {275, 3620, 264, 3532, 1};
 inline lv_obj_t* root = nullptr;
 inline lv_obj_t* binLabel = nullptr;            // 仓号文字 (仓1)
 inline lv_obj_t* connLamp = nullptr;            // 在线/离线 大圆灯
+inline lv_obj_t* warnBox = nullptr;             // 离线警告框(左上角)
 inline lv_obj_t* statusDots[BIN_COUNT] = {};    // 6仓状态灯 (左到右1-6)
 inline lv_obj_t* binWeightLabel = nullptr;      // 中间130px大数字 (仓重)
 inline lv_obj_t* kgLabel = nullptr;             // 仓重 kg单位(缩小,在数字下方)
 inline lv_obj_t* curWeightLabel = nullptr;      // 左侧称重重量
 inline lv_obj_t* curKgLabel = nullptr;          // 称重 kg单位(缩小,在数字下方)
-inline lv_obj_t* messageLabel = nullptr;
 inline lv_obj_t* btnLoad = nullptr;
 inline lv_obj_t* btnUnload = nullptr;
 inline lv_obj_t* btnEdit = nullptr;
@@ -107,31 +107,25 @@ inline void setButtonsEnabled(bool enabled) {
 inline void updateConnLamp();
 inline void openEditPanel();
 inline void updateWeights();
-inline void showMessage(const char* text, bool error, bool persistent);
 inline void closeModal();
 inline void modalCloseEvent(lv_event_t* e);
 inline void updateBinDots();
 inline void showDevBinDialog();
+inline void setOnline(bool isOnline);
 
-// ===== 消息栏 =====
+// ===== 消息栏 (已移除UI, 保留接口仅作日志/离线控制) =====
 inline void showMessage(const char* text, bool error = false, bool persistent = false) {
-    if (!messageLabel) return;
-    lv_label_set_text(messageLabel, text);
-    lv_obj_set_style_text_color(messageLabel, C(error ? CLR_RED : CLR_ROASTEK), 0);
+    if (text) Serial.printf("[MSG] %s%s\n", error ? "[ERR] " : "", text);
     persistentError = persistent;
     if (persistent) {
-        normalMessageUntil = 0;
-        setButtonsEnabled(false);
+        setOnline(false);  // 持续报错=离线,显示警告框+禁用按钮
     } else {
-        normalMessageUntil = millis() + MESSAGE_CLEAR_MS;
-        setButtonsEnabled(true);
+        setOnline(true);
     }
 }
 
 inline void clearMessage() {
-    if (!messageLabel || persistentError) return;
-    lv_label_set_text(messageLabel, "");
-    normalMessageUntil = 0;
+    persistentError = false;
 }
 
 // ===== 模态关闭 =====
@@ -591,6 +585,21 @@ inline void updateWeights() {
     lv_label_set_text(curWeightLabel, buf);
 }
 
+// ===== 更新在线/离线灯 + 警告框 =====
+inline void setOnline(bool isOnline) {
+    online = isOnline;
+    updateConnLamp();
+    if (warnBox) {
+        if (online) lv_obj_add_flag(warnBox, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_clear_flag(warnBox, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (online) {
+        setButtonsEnabled(true);
+    } else {
+        setButtonsEnabled(false);
+    }
+}
+
 // ===== 更新在线/离线灯 =====
 inline void updateConnLamp() {
     if (!connLamp) return;
@@ -681,8 +690,8 @@ inline void buildHome() {
     lv_obj_align(btnEdit, LV_ALIGN_RIGHT_MID, -8, 0);
     lv_obj_add_event_cb(btnEdit, buttonEvent, LV_EVENT_CLICKED, const_cast<char*>("edit"));
 
-    // --- 中间区: 左1/4称重重量 + 右3/4仓重大数字 ---
-    // 屏幕480宽: 左边120 (1/4), 右边360 (3/4)
+    // --- 中间区: 左1/4称重重量 + 右3/4仓重大数字 (占满,与编辑按钮齐平) ---
+    // 屏幕480宽: 左边120 (1/4) x=0..120, 右边360 (3/4) x=120..480
     lv_obj_t* middle = lv_obj_create(root);
     lv_obj_remove_style_all(middle);
     lv_obj_set_size(middle, SCREEN_WIDTH, 190);
@@ -691,24 +700,38 @@ inline void buildHome() {
     lv_obj_set_style_bg_opa(middle, LV_OPA_COVER, 0);
     lv_obj_clear_flag(middle, LV_OBJ_FLAG_SCROLLABLE);
 
-    // === 左侧: 称重重量 (占1/4, 宽120) ===
-    // 称重数字用中等字体(montserrat_48), kg在下方缩小(montserrat_24)
+    // 离线警告框 (左上角,只占左1/4区域,默认隐藏,离线时显示)
+    warnBox = lv_obj_create(middle);
+    lv_obj_remove_style_all(warnBox);
+    lv_obj_set_size(warnBox, 116, 56);
+    lv_obj_align(warnBox, LV_ALIGN_TOP_LEFT, 2, 2);
+    lv_obj_set_style_bg_color(warnBox, C(CLR_RED), 0);
+    lv_obj_set_style_bg_opa(warnBox, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(warnBox, 6, 0);
+    lv_obj_clear_flag(warnBox, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(warnBox, LV_OBJ_FLAG_HIDDEN);  // 默认隐藏
+    lv_obj_t* warnLbl = makeLabel(warnBox, "!\n离线", &lv_font_chinese_14, lv_color_white());
+    lv_obj_set_style_text_align(warnLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(warnLbl);
+
+    // === 左侧: 称重重量 (占满左1/4, 宽120) 居中显示 ===
     curWeightLabel = makeLabel(middle, "--", &lv_font_montserrat_48, C(CLR_TEXT));
-    lv_obj_align(curWeightLabel, LV_ALIGN_TOP_LEFT, 8, 50);
+    // 称重在警告框下方,垂直居中偏下
+    lv_obj_align(curWeightLabel, LV_ALIGN_TOP_LEFT, 30, 95);
 
     curKgLabel = makeLabel(middle, "kg", &lv_font_montserrat_24, C(CLR_MUTED));
     lv_obj_align_to(curKgLabel, curWeightLabel, LV_ALIGN_OUT_BOTTOM_MID, 0, 2);
 
-    // === 右侧: 仓重大数字 (占3/4, 从x=120开始) ===
-    // 130px大数字,kg在下方缩小(montserrat_24)
+    // === 右侧: 仓重大数字 (占满右3/4, x=120..480) ===
+    // 130px大数字,居中在右3/4区域; kg在下方缩小
     binWeightLabel = makeLabel(middle, "--", &lv_font_numbers_130, C(CLR_TEXT));
-    lv_obj_align(binWeightLabel, LV_ALIGN_TOP_LEFT, 135, 10);
+    lv_obj_align(binWeightLabel, LV_ALIGN_TOP_MID, 60, 20);
 
     kgLabel = makeLabel(middle, "kg", &lv_font_montserrat_24, C(CLR_MUTED));
-    // kg在大数字下方居中(大数字宽约260,放在数字右下避免穿模)
-    lv_obj_align(kgLabel, LV_ALIGN_TOP_LEFT, 135 + 200, 120);
+    // kg在大数字下方居中
+    lv_obj_align(kgLabel, LV_ALIGN_TOP_MID, 60, 150);
 
-    // --- 底部 (沿用老版本: 消息区在上 + 上料/下料两个大按钮在下) ---
+    // --- 底部 (只放加大加高的上料/下料按钮, 去掉消息提示) ---
     lv_obj_t* bottom = lv_obj_create(root);
     lv_obj_remove_style_all(bottom);
     lv_obj_set_size(bottom, SCREEN_WIDTH, 70);
@@ -716,28 +739,19 @@ inline void buildHome() {
     lv_obj_set_style_bg_color(bottom, C(CLR_WHITE), 0);  // 底部白
     lv_obj_set_style_bg_opa(bottom, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(bottom, 4, 0);
-    lv_obj_set_flex_flow(bottom, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(bottom, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(bottom, LV_OBJ_FLAG_SCROLLABLE);
 
-    // 消息区 (居中, 宽470)
-    messageLabel = lv_label_create(bottom);
-    lv_label_set_text(messageLabel, "");
-    lv_obj_set_style_text_font(messageLabel, &lv_font_chinese_14, 0);
-    lv_obj_set_style_text_color(messageLabel, C(CLR_TEXT), 0);
-    lv_obj_set_style_text_align(messageLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_size(messageLabel, SCREEN_WIDTH - 10, 22);
-
-    // 按钮区 (上料/下料两个大按钮并排)
+    // 按钮区 (上料/下料两个大按钮并排, 加大加高)
     lv_obj_t* btnRow = lv_obj_create(bottom);
     lv_obj_remove_style_all(btnRow);
-    lv_obj_set_size(btnRow, SCREEN_WIDTH - 8, 44);
+    lv_obj_set_size(btnRow, SCREEN_WIDTH - 8, 62);
+    lv_obj_align(btnRow, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_flex_flow(btnRow, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(btnRow, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     btnLoad = lv_btn_create(btnRow);
-    lv_obj_set_size(btnLoad, 230, 44);
-    lv_obj_set_style_radius(btnLoad, 6, 0);
+    lv_obj_set_size(btnLoad, 230, 58);
+    lv_obj_set_style_radius(btnLoad, 8, 0);
     lv_obj_set_style_bg_color(btnLoad, C(CLR_ROASTEK), 0);
     lv_obj_set_style_bg_opa(btnLoad, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(btnLoad, 0, 0);
@@ -747,8 +761,8 @@ inline void buildHome() {
     lv_obj_center(feedLbl);
 
     btnUnload = lv_btn_create(btnRow);
-    lv_obj_set_size(btnUnload, 230, 44);
-    lv_obj_set_style_radius(btnUnload, 6, 0);
+    lv_obj_set_size(btnUnload, 230, 58);
+    lv_obj_set_style_radius(btnUnload, 8, 0);
     lv_obj_set_style_bg_color(btnUnload, C(CLR_ROASTEK), 0);
     lv_obj_set_style_bg_opa(btnUnload, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(btnUnload, 0, 0);
@@ -796,10 +810,6 @@ inline void Display_Loop() {
         lastSimUpdate = now;
         simCurrentWeight = 25.0f + 4.0f * sinf(now / 1600.0f);
         updateWeights();
-    }
-
-    if (!persistentError && normalMessageUntil && static_cast<int32_t>(now - normalMessageUntil) >= 0) {
-        clearMessage();
     }
 }
 
