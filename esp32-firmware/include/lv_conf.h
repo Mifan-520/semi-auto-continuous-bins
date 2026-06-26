@@ -14,6 +14,7 @@
 
 #define LV_DISP_DEF_REFR_PERIOD 30
 #define LV_INDEV_DEF_READ_PERIOD 30
+#define LV_INDEV_DEF_LONG_PRESS_TIME 4000   // 长按4秒(开发者模式)
 
 #define LV_TICK_CUSTOM 0
 #define LV_DPI_DEF 130

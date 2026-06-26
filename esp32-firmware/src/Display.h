@@ -513,18 +513,20 @@ inline void buttonEvent(lv_event_t* e) {
 inline void devBinSelectEvent(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    uint8_t oldBin = localBin;
     localBin = idx;
-    Serial.printf("[EVENT] 开发者模式: 本机仓号设为 仓%d\n", idx + 1);
-    // 同步到 ESP-NOW 组网
-    EspnowMesh_SetMyBin(idx + 1);
+    Serial.printf("[EVENT] 开发者模式: 本机仓号 仓%d → 仓%d\n", oldBin + 1, idx + 1);
+    // ESP-NOW: 旧仓下线 + 新仓上线(自动通知Display更新灯)
+    EspnowMesh_OnBinChanged(oldBin + 1, idx + 1);
     closeModal();
     // 更新顶栏仓号文字
     char binTitle[8];
     snprintf(binTitle, sizeof(binTitle), "仓%d", localBin + 1);
     lv_label_set_text(binLabel, binTitle);
-    updateBinDots();
     updateWeights();
-    nvsSaveBinWeights();  // 仓号持久化
+    nvsSaveBinWeights();
+    // 强制广播新仓号(不等心跳周期)
+    EspnowMesh_BroadcastHeartbeat(binWeights[localBin], simCurrentWeight);
     Serial.printf("[NVS] 本机仓号已保存: 仓%d\n", localBin + 1);
 }
 

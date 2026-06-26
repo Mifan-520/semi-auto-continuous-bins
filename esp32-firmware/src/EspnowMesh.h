@@ -69,6 +69,25 @@ inline void EspnowMesh_SetGateway(bool isGw) {
     myIsGateway = isGw;
 }
 
+// ===== 本机换仓: 旧仓下线, 新仓上线(通知Display更新灯) =====
+inline void EspnowMesh_OnBinChanged(uint8_t oldBinId, uint8_t newBinId) {
+    // 旧仓标记离线
+    if (oldBinId >= 1 && oldBinId <= BIN_COUNT && oldBinId != newBinId) {
+        binStates[oldBinId - 1].online = false;
+        if (gOnBinStateCb) gOnBinStateCb(oldBinId, false, 0, 0);
+    }
+    // 新仓标记在线
+    myBinId = newBinId;
+    if (newBinId >= 1 && newBinId <= BIN_COUNT) {
+        uint8_t idx = newBinId - 1;
+        binStates[idx].online = true;
+        binStates[idx].lastHeardMs = millis();
+        memcpy(binStates[idx].mac, myMac, 6);
+        if (gOnBinStateCb) gOnBinStateCb(newBinId, true, 0, 0);
+    }
+    Serial.printf("[ESPNOW] 本机换仓: %d→%d\n", oldBinId, newBinId);
+}
+
 // ===== 广播一个心跳 =====
 inline void EspnowMesh_BroadcastHeartbeat(float binWeight, float currentWeight) {
     HeartbeatPacket pkt;
