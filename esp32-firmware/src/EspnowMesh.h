@@ -25,10 +25,10 @@ struct HeartbeatPacket {
     uint32_t magic;          // 魔数 0xA33E0001, 用于识别本协议包
     uint8_t  binId;          // 仓号 1-6 (发送方的仓号)
     uint8_t  role;           // 角色: 0=普通节点, 1=网关
-    uint8_t  reserved;       // 保留
+    uint8_t  bleConnected;   // 发送方是否已连上BLE称重模块 (1=已连,读到的重量在currentWeight)
     uint8_t  online;         // 发送方自报在线状态 (1=在线)
     float    binWeight;      // 发送方本机仓重
-    float    currentWeight;  // 发送方当前称重
+    float    currentWeight;  // 发送方当前称重 (若bleConnected=1, 这是真实A33E毛重)
     uint32_t seq;            // 序列号(递增)
     uint8_t  mac[6];         // 发送方MAC (冗余, 便于调试)
 };
@@ -52,6 +52,7 @@ struct BinState {
     uint32_t lastHeardMs;    // 最后一次收到心跳的时间
     float    binWeight;      // 该仓的仓重
     float    currentWeight;  // 该仓的当前称重
+    uint8_t  bleConnected;   // 该仓是否已连上BLE称重模块
     uint8_t  mac[6];         // 该仓的MAC
 };
 
@@ -78,6 +79,19 @@ inline OnBinWeightSyncCb gOnBinWeightSyncCb = nullptr;
 typedef void (*OnSilenceCb)(bool silent);
 inline OnSilenceCb gOnSilenceCb = nullptr;
 
+// ===== 回调: 远程BLE称重状态变化 =====
+// 当任一远端屏幕连上/断开BLE称重模块时通知本机, 本机据此决定是否启动自己的BLE
+// remoteBleConnected: 是否有其他屏幕已连上模块
+// weight: 若已连上, 这是它读到的实时重量 (其他屏共享这个重量)
+typedef void (*OnRemoteBleCb)(bool remoteBleConnected, float weight);
+inline OnRemoteBleCb gOnRemoteBleCb = nullptr;
+
+// 远程BLE状态追踪: 是否有其他屏连上了BLE模块, 以及它读到的重量
+inline bool     gRemoteBleConnected = false;   // 有没有别台连上了BLE
+inline float    gRemoteBleWeight = 0.0f;       // 别台读到的重量
+inline uint32_t gRemoteBleLastMs = 0;          // 最后一次收到 bleConnected=1 心跳的时间
+inline uint8_t  gRemoteBleBin = 0;             // 是哪台连上的 (仓号)
+
 inline void EspnowMesh_SetStateCallback(OnBinStateChangeCb cb) {
     gOnBinStateCb = cb;
 }
@@ -88,6 +102,21 @@ inline void EspnowMesh_SetWeightSyncCallback(OnBinWeightSyncCb cb) {
 
 inline void EspnowMesh_SetSilenceCallback(OnSilenceCb cb) {
     gOnSilenceCb = cb;
+}
+
+inline void EspnowMesh_SetRemoteBleCallback(OnRemoteBleCb cb) {
+    gOnRemoteBleCb = cb;
+}
+
+// 供 BleScaleClient 查询: 是否已有其他屏连上BLE模块 (本机就不该再去连)
+inline bool EspnowMesh_RemoteBleActive() {
+    // 8秒内收到过 bleConnected=1 的心跳才算"有人连着"
+    return gRemoteBleConnected && (millis() - gRemoteBleLastMs < 8000);
+}
+
+// 供 BleScaleClient 查询: 其他屏读到的共享重量
+inline float EspnowMesh_RemoteBleWeight() {
+    return gRemoteBleWeight;
 }
 
 inline void EspnowMesh_SetMyBin(uint8_t binId) {
@@ -134,13 +163,19 @@ inline void EspnowMesh_OnBinChanged(uint8_t oldBinId, uint8_t newBinId, float ne
     EspnowMesh_AnnounceOnline(newBinWeight, currentWeight, 5, 40);
 }
 
+// 本机BLE连接状态 (由 BleScaleClient 通过本函数更新)
+inline uint8_t gLocalBleConnected = 0;  // 0=未连, 1=已连
+inline void EspnowMesh_SetLocalBleConnected(bool connected) {
+    gLocalBleConnected = connected ? 1 : 0;
+}
+
 // ===== 广播一个心跳 =====
 inline void EspnowMesh_BroadcastHeartbeat(float binWeight, float currentWeight) {
     HeartbeatPacket pkt;
     pkt.magic = HEARTBEAT_MAGIC;
     pkt.binId = myBinId;
     pkt.role = myIsGateway ? 1 : 0;
-    pkt.reserved = 0;
+    pkt.bleConnected = gLocalBleConnected;  // 本机是否已连上BLE模块
     pkt.online = 1;
     pkt.binWeight = binWeight;
     pkt.currentWeight = currentWeight;
@@ -221,7 +256,22 @@ inline void onEspNowRecv(const uint8_t* mac_addr, const uint8_t* data, int len) 
     binStates[idx].lastHeardMs = millis();
     binStates[idx].binWeight = pkt.binWeight;
     binStates[idx].currentWeight = pkt.currentWeight;
+    binStates[idx].bleConnected = pkt.bleConnected;
     memcpy(binStates[idx].mac, pkt.mac, 6);
+
+    // ---- BLE称重协调: 对方报 bleConnected=1 → 记录, 通知本机停掉自己的BLE ----
+    if (pkt.bleConnected) {
+        bool wasRemoteActive = gRemoteBleConnected;
+        gRemoteBleConnected = true;
+        gRemoteBleLastMs = millis();
+        gRemoteBleWeight = pkt.currentWeight;
+        gRemoteBleBin = pkt.binId;
+        if (!wasRemoteActive) {
+            Serial.printf("[ESPNOW] 远程仓%d 已连上BLE称重 (重量=%.1f kg), 本机停止BLE\n",
+                          pkt.binId, pkt.currentWeight);
+            if (gOnRemoteBleCb) gOnRemoteBleCb(true, pkt.currentWeight);
+        }
+    }
 
     // 首次上线打印日志
     if (!wasOnline) {

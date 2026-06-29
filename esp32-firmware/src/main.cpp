@@ -2,12 +2,12 @@
 #include "Config.h"
 #include "CloudReport.h"
 #include "EspnowMesh.h"
-// #include "BleScaleClient.h"  // 等I6328A模块到货再启用
+#include "BleScaleClient.h"
 #include "Display.h"
 
 static uint32_t lastLvTick = 0;
 static bool selfTestDone = false;
-static float simFallbackWeight = 25.3f;  // 蓝牙未连接时的模拟重量
+static float simFallbackWeight = 0.0f;  // BLE断连时的回退重量(0kg)
 
 // ESP-NOW 收到某仓状态变化 → 通知Display更新对应灯
 void onBinStateChange(uint8_t binId, bool online, float binWeight, float currentWeight) {
@@ -36,6 +36,7 @@ void setup() {
     // 否则会出现 UI 显示仓5、网络仍广播仓1 的错位。
     const uint8_t localBinId = Display_GetLocalBinId();
     EspnowMesh_SetMyBin(localBinId);
+    BleScale_SetMyBinId(localBinId);   // 让BLE任务知道本机仓号, 决定是否主动连模块
     EspnowMesh_SetGateway(DEFAULT_GATEWAY_FLAG);
     EspnowMesh_SetStateCallback(onBinStateChange);
     EspnowMesh_SetWeightSyncCallback(Display_OnBinWeightSync);
@@ -47,7 +48,8 @@ void setup() {
         EspnowMesh_AnnounceOnline(Display_GetBinWeight(), Display_GetCurrentWeight(), 5, 40);
     }
 
-    // 3. 蓝牙称重:等I6328A到货后取消注释 BleScale_Init/BleScale_Loop
+    // 3. 蓝牙称重: 启用 BLE 读 A33E 毛重
+    BleScale_Init();
 
     lastLvTick = millis();
 }
@@ -72,9 +74,8 @@ void loop() {
         simFallbackWeight = 25.0f + 4.0f * sinf(now / 1600.0f);
     }
 
-    // 蓝牙读真实重量 (优先), 断连时回退到 simFallbackWeight
-    // 等I6328A到货: float currentWeight = BleScale_Loop(simFallbackWeight);
-    float currentWeight = simFallbackWeight;
+    // 蓝牙读真实重量 (优先), 断连时回退到 simFallbackWeight(0kg)
+    float currentWeight = BleScale_Loop(simFallbackWeight);
 
     // 更新 Display 当前称重
     Display_SetCurrentWeight(currentWeight);
