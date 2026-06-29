@@ -544,6 +544,7 @@ inline void devBinSelectEvent(lv_event_t* e) {
     uint8_t oldBin = localBin;
     localBin = idx;
     Serial.printf("[EVENT] 开发者模式: 本机仓号 仓%d → 仓%d\n", oldBin + 1, idx + 1);
+    BleScale_SetMyBinId(localBin + 1);  // 立即更新BLE错峰优先级，不能只改UI/ESP-NOW
     // ESP-NOW: 旧仓下线 + 新仓上线(自动通知Display更新灯) + 连发3次心跳
     EspnowMesh_OnBinChanged(oldBin + 1, idx + 1, binWeights[idx], simCurrentWeight);
     closeModal();

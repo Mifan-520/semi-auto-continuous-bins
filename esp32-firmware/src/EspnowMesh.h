@@ -18,6 +18,7 @@ static constexpr uint8_t ESPNOW_CHANNEL = 6;
 static constexpr uint32_t HEARTBEAT_INTERVAL_MS = 2000;   // 每2秒广播一次心跳
 static constexpr uint32_t OFFLINE_TIMEOUT_MS = 10000;     // 10秒没收到某仓=该仓离线
 static constexpr uint32_t SILENCE_TIMEOUT_MS = 8000;      // 8秒没收到任何广播=全静默(断网)
+static constexpr uint32_t REMOTE_BLE_LEASE_MS = 6000;     // 远程有效称重租约，超过即允许其他设备接管
 
 // 心跳包结构 (固定24字节, 便于广播)
 #pragma pack(push, 1)
@@ -87,10 +88,11 @@ typedef void (*OnRemoteBleCb)(bool remoteBleConnected, float weight);
 inline OnRemoteBleCb gOnRemoteBleCb = nullptr;
 
 // 远程BLE状态追踪: 是否有其他屏连上了BLE模块, 以及它读到的重量
-inline bool     gRemoteBleConnected = false;   // 有没有别台连上了BLE
-inline float    gRemoteBleWeight = 0.0f;       // 别台读到的重量
-inline uint32_t gRemoteBleLastMs = 0;          // 最后一次收到 bleConnected=1 心跳的时间
-inline uint8_t  gRemoteBleBin = 0;             // 是哪台连上的 (仓号)
+inline volatile bool     gRemoteBleConnected = false;   // 有没有别台持有有效称重租约
+inline volatile float    gRemoteBleWeight = 0.0f;       // 别台读到的净重
+inline volatile uint32_t gRemoteBleLastMs = 0;          // 最后一次收到 bleConnected=1 心跳的时间
+inline volatile uint8_t  gRemoteBleBin = 0;             // 是哪台持有租约 (仓号)
+inline uint8_t gRemoteBleMac[6] = {0};                  // 租约持有者MAC，用于精确释放和竞态裁决
 
 inline void EspnowMesh_SetStateCallback(OnBinStateChangeCb cb) {
     gOnBinStateCb = cb;
@@ -110,13 +112,25 @@ inline void EspnowMesh_SetRemoteBleCallback(OnRemoteBleCb cb) {
 
 // 供 BleScaleClient 查询: 是否已有其他屏连上BLE模块 (本机就不该再去连)
 inline bool EspnowMesh_RemoteBleActive() {
-    // 8秒内收到过 bleConnected=1 的心跳才算"有人连着"
-    return gRemoteBleConnected && (millis() - gRemoteBleLastMs < 8000);
+    return gRemoteBleConnected && (millis() - gRemoteBleLastMs < REMOTE_BLE_LEASE_MS);
 }
 
 // 供 BleScaleClient 查询: 其他屏读到的共享重量
 inline float EspnowMesh_RemoteBleWeight() {
     return gRemoteBleWeight;
+}
+
+// 所有设备都可尝试连接。只有两台几乎同时拿到有效数据时，才用仓号+MAC裁决：
+// 仓号小者优先；仓号相同则MAC字典序小者优先，保证双方得出同一个赢家。
+inline int EspnowMesh_CompareBleOwner(uint8_t binA, const uint8_t macA[6],
+                                      uint8_t binB, const uint8_t macB[6]) {
+    if (binA != binB) return (binA < binB) ? -1 : 1;
+    return memcmp(macA, macB, 6);
+}
+
+inline bool EspnowMesh_RemoteBleWinsTie() {
+    if (!EspnowMesh_RemoteBleActive()) return false;
+    return EspnowMesh_CompareBleOwner(gRemoteBleBin, gRemoteBleMac, myBinId, myMac) < 0;
 }
 
 inline void EspnowMesh_SetMyBin(uint8_t binId) {
@@ -164,9 +178,14 @@ inline void EspnowMesh_OnBinChanged(uint8_t oldBinId, uint8_t newBinId, float ne
 }
 
 // 本机BLE连接状态 (由 BleScaleClient 通过本函数更新)
-inline uint8_t gLocalBleConnected = 0;  // 0=未连, 1=已连
+inline volatile uint8_t gLocalBleConnected = 0;  // 0=无有效数据, 1=持有有效净重租约
+inline volatile bool gForceHeartbeatPending = false;
 inline void EspnowMesh_SetLocalBleConnected(bool connected) {
-    gLocalBleConnected = connected ? 1 : 0;
+    uint8_t next = connected ? 1 : 0;
+    if (gLocalBleConnected != next) {
+        gLocalBleConnected = next;
+        gForceHeartbeatPending = true;  // 断联/接管不等待下一个2秒周期
+    }
 }
 
 // ===== 广播一个心跳 =====
@@ -259,18 +278,32 @@ inline void onEspNowRecv(const uint8_t* mac_addr, const uint8_t* data, int len) 
     binStates[idx].bleConnected = pkt.bleConnected;
     memcpy(binStates[idx].mac, pkt.mac, 6);
 
-    // ---- BLE称重协调: 对方报 bleConnected=1 → 记录, 通知本机停掉自己的BLE ----
+    // ---- BLE称重协调: bleConnected 表示“有近期有效净重”，不是仅GATT物理连接 ----
     if (pkt.bleConnected) {
-        bool wasRemoteActive = gRemoteBleConnected;
-        gRemoteBleConnected = true;
-        gRemoteBleLastMs = millis();
-        gRemoteBleWeight = pkt.currentWeight;
-        gRemoteBleBin = pkt.binId;
-        if (!wasRemoteActive) {
+        bool wasRemoteActive = EspnowMesh_RemoteBleActive();
+        bool sameOwner = gRemoteBleConnected && memcmp(pkt.mac, gRemoteBleMac, 6) == 0;
+        bool betterOwner = !wasRemoteActive || sameOwner ||
+            EspnowMesh_CompareBleOwner(pkt.binId, pkt.mac, gRemoteBleBin, gRemoteBleMac) < 0;
+        if (betterOwner) {
+            gRemoteBleConnected = true;
+            gRemoteBleLastMs = millis();
+            gRemoteBleWeight = pkt.currentWeight;
+            gRemoteBleBin = pkt.binId;
+            memcpy(gRemoteBleMac, pkt.mac, 6);
+        }
+        if (!wasRemoteActive && betterOwner) {
             Serial.printf("[ESPNOW] 远程仓%d 已连上BLE称重 (重量=%.1f kg), 本机停止BLE\n",
                           pkt.binId, pkt.currentWeight);
             if (gOnRemoteBleCb) gOnRemoteBleCb(true, pkt.currentWeight);
         }
+    } else if (gRemoteBleConnected && memcmp(pkt.mac, gRemoteBleMac, 6) == 0) {
+        // 只有当前租约持有者的断联心跳才释放，其他普通节点的0不能误清租约。
+        Serial.printf("[ESPNOW] 远程仓%d 主动释放BLE称重租约\n", pkt.binId);
+        gRemoteBleConnected = false;
+        gRemoteBleLastMs = 0;
+        gRemoteBleBin = 0;
+        memset(gRemoteBleMac, 0, sizeof(gRemoteBleMac));
+        if (gOnRemoteBleCb) gOnRemoteBleCb(false, 0.0f);
     }
 
     // 首次上线打印日志
@@ -344,7 +377,8 @@ inline void EspnowMesh_Loop(float myBinWeight, float myCurrentWeight) {
     uint32_t now = millis();
 
     // 定时广播心跳 + 日志
-    if (now - lastHeartbeatSentMs >= HEARTBEAT_INTERVAL_MS) {
+    if (gForceHeartbeatPending || now - lastHeartbeatSentMs >= HEARTBEAT_INTERVAL_MS) {
+        gForceHeartbeatPending = false;
         lastHeartbeatSentMs = now;
         EspnowMesh_BroadcastHeartbeat(myBinWeight, myCurrentWeight);
         static uint32_t lastSendLogMs = 0;
@@ -353,6 +387,17 @@ inline void EspnowMesh_Loop(float myBinWeight, float myCurrentWeight) {
             Serial.printf("[ESPNOW] 发: 仓%d seq=%u bw=%.1f cw=%.1f\n",
                           myBinId, hbSeq, myBinWeight, myCurrentWeight);
         }
+    }
+
+    // 租约持有者消失但没有来得及发断联包时，超时释放并启动新一轮抢连。
+    if (gRemoteBleConnected && now - gRemoteBleLastMs >= REMOTE_BLE_LEASE_MS) {
+        uint8_t expiredBin = gRemoteBleBin;
+        gRemoteBleConnected = false;
+        gRemoteBleLastMs = 0;
+        gRemoteBleBin = 0;
+        memset(gRemoteBleMac, 0, sizeof(gRemoteBleMac));
+        Serial.printf("[ESPNOW] 远程仓%d BLE称重租约超时，允许接管\n", expiredBin);
+        if (gOnRemoteBleCb) gOnRemoteBleCb(false, 0.0f);
     }
 
     // 检测其他仓离线

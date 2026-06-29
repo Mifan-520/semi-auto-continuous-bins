@@ -1,5 +1,5 @@
 // ============================================================
-//  ESP32 BLE 实时读取 A33E 毛重 (经 I6328A-485 透传)
+//  ESP32 BLE 实时读取 A33E 净重 (经 I6328A-485 透传)
 //
 //  链路: A33E表头(9600) ──RS485──> I6328A-485(9600,BLE从机)
 //                                    ══BLE══ ESP32(BLE主机)
@@ -8,10 +8,10 @@
 //    ESP32 通过 BLE Write(0xFFE1) 发 Modbus-RTU 请求帧
 //    模块从 UART/485 透传给 A33E, A33E 回 Modbus 响应
 //    响应经模块 UART→BLE Notify(0xFFE2) 回到 ESP32
-//    ESP32 累积 Notify 字节, 凑齐整帧后解析 float 毛重
+//    ESP32 累积 Notify 字节, 凑齐整帧后解析 float 净重
 //
-//  Modbus 请求: 读保持寄存器, 站号1, 地址8(毛重float), 数量2
-//    01 03 00 08 00 02 45 C1
+//  Modbus 请求: 读保持寄存器, 站号1, 地址6(净重float), 数量2
+//    01 03 00 06 00 02 24 0A
 //
 //  Modbus 响应: 01 03 04 [4字节float] [CRC2字节] = 9字节
 // ============================================================
@@ -36,9 +36,9 @@ static BLEUUID SERVICE_UUID("0000ffe0-0000-1000-8000-00805f9b34fb");
 static BLEUUID WRITE_UUID  ("0000ffe1-0000-1000-8000-00805f9b34fb");
 static BLEUUID NOTIFY_UUID ("0000ffe2-0000-1000-8000-00805f9b34fb");
 
-// ---------- 读毛重 Modbus-RTU 请求 ----------
-// 站号1, 功能码03, 起始地址0x0008, 数量2, CRC
-static uint8_t MODBUS_REQ[] = {0x01, 0x03, 0x00, 0x08, 0x00, 0x02, 0x45, 0xC1};
+// ---------- 读净重 Modbus-RTU 请求 ----------
+// 站号1, 功能码03, 起始地址0x0006, 数量2, CRC(低字节在前)
+static uint8_t MODBUS_REQ[] = {0x01, 0x03, 0x00, 0x06, 0x00, 0x02, 0x24, 0x0A};
 static const uint32_t READ_INTERVAL_MS = 500;   // 500ms 读一次
 static const uint32_t RESYNC_TIMEOUT_MS = 200;  // 200ms 没凑成帧就认为残包, 清缓冲重新累积
 
@@ -73,22 +73,24 @@ static uint16_t modbusCRC16(const uint8_t* data, size_t len) {
 
 // ---------- float 字节序工具 ----------
 static float bytesToFloat(const uint8_t* p, bool swapWords) {
-    uint8_t b[4];
+    uint32_t raw;
     if (swapWords) {
         // CDAB (寄存器内大端, 寄存器间小端)
-        b[0] = p[2]; b[1] = p[3]; b[2] = p[0]; b[3] = p[1];
+        raw = ((uint32_t)p[2] << 24) | ((uint32_t)p[3] << 16) |
+              ((uint32_t)p[0] << 8) | (uint32_t)p[1];
     } else {
         // ABCD (全大端)
-        b[0] = p[0]; b[1] = p[1]; b[2] = p[2]; b[3] = p[3];
+        raw = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+              ((uint32_t)p[2] << 8) | (uint32_t)p[3];
     }
     float f;
-    memcpy(&f, b, 4);
+    memcpy(&f, &raw, 4);
     return f;
 }
 
 // ---------- 尝试从缓冲解析一帧 Modbus 响应 ----------
-// 成功返回 true 并把重量写入 outGross
-static bool tryParseFrame(float* outGross, bool* outSwap) {
+// 成功返回 true并把重量写入outNet
+static bool tryParseFrame(float* outNet, bool* outSwap) {
     if (rxlen < 9) return false;
 
     // 找帧头: 01 03 04 (站号1 + 功能码3 + 字节数4)
@@ -114,7 +116,7 @@ static bool tryParseFrame(float* outGross, bool* outSwap) {
     float fBE  = bytesToFloat(frame + 3, false);  // ABCD
     float fSW  = bytesToFloat(frame + 3, true);   // CDAB
     *outSwap = false;
-    *outGross = fBE;
+    *outNet = fBE;
     // 同时打印两种, 方便对照哪个对
     Serial.printf("[Modbus] raw=%02X %02X %02X %02X  big-endian=%.3f  swap-word=%.3f\n",
                   frame[3], frame[4], frame[5], frame[6], fBE, fSW);
@@ -161,7 +163,7 @@ static bool connectToServer(BLEAddress addr) {
         pNotify->registerForNotify(notifyCallback);
     }
     connected = true;
-    Serial.println("[BLE] ✅ 已连接, 开始读 A33E 毛重...");
+    Serial.println("[BLE] ✅ 已连接, 开始读 A33E 净重...");
     return true;
 }
 
@@ -191,7 +193,7 @@ void setup() {
     Serial.begin(115200);
     delay(300);
     Serial.println("\n=============================");
-    Serial.println(" ESP32 BLE 实时读 A33E 毛重");
+    Serial.println(" ESP32 BLE 实时读 A33E 净重");
     Serial.println("=============================");
     BLEDevice::init("ESP32-A33E-Reader");
 }
@@ -243,13 +245,13 @@ void loop() {
     }
 
     // 4. 收齐整帧后解析
-    float gross;
+    float net;
     bool swap;
-    if (tryParseFrame(&gross, &swap)) {
+    if (tryParseFrame(&net, &swap)) {
         okCount++;
         // 这里先按 big-endian 显示, 如果你看 swap-word 那个数对,
         // 告诉我, 我把解析固定成 swap 字节序
-        Serial.printf(">>> 毛重 = %.3f kg  (OK=%u ERR=%u)\n", gross, okCount, errCount);
+        Serial.printf(">>> 净重 = %.3f kg  (OK=%u ERR=%u)\n", net, okCount, errCount);
         rxlen = 0;
     }
 }

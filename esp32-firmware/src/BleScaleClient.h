@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================
-//  BLE Client 称重读取 — 连接 I6328A-485 透传模块, 读 A33E 毛重
+//  BLE Client 称重读取 — 连接 I6328A-485 透传模块, 读 A33E 净重
 //
 //  链路: A33E表头(9600) ──RS485──> I6328A-485(BLE从机)
 //                                    ══BLE══ ESP32(BLE主机)
@@ -11,7 +11,7 @@
 //  所以 BLE 全部逻辑放在独立 FreeRTOS 任务里, 主循环只读取
 //  共享的最新重量值, UI/ESP-NOW 完全不受 BLE 阻塞影响。
 //
-//  读取到的真实毛重会通过 main.cpp → Display_SetCurrentWeight
+//  读取到的真实净重会通过 main.cpp → Display_SetCurrentWeight
 //  → ESP-NOW 心跳的 currentWeight 字段自动广播给其他屏。
 // ============================================================
 
@@ -30,7 +30,7 @@
 #endif
 
 // 用 MAC 直连, 跳过扫描 (WiFi/ESP-NOW 共存时被动扫描收不到设备名)
-// 每台屏配自己的模块, 改这里为该模块的 MAC (大写带冒号)
+// 六台屏竞争连接同一个模块；所有固件必须配置成同一个模块MAC。
 #ifndef BLE_SCALE_DEVICE_MAC
 #define BLE_SCALE_DEVICE_MAC "39:02:01:D0:5A:50"
 #endif
@@ -42,16 +42,20 @@ static BLEUUID BLE_SCALE_NOTIFY_UUID ("0000ffe2-0000-1000-8000-00805f9b34fb");
 
 // ---------- 节奏 ----------
 #ifndef BLE_SCALE_READ_INTERVAL_MS
-#define BLE_SCALE_READ_INTERVAL_MS 2000   // 2秒读一次
+#define BLE_SCALE_READ_INTERVAL_MS 500    // 500ms读一次，尽快建立/续租有效称重
 #endif
-#define BLE_SCALE_CONNECT_TIMEOUT_MS 5000 // 连接超时5秒(避免阻塞过久)
 #define BLE_SCALE_RESYNC_MS 400           // 残包超时
 #define BLE_SCALE_DATA_VALID_MS 5000      // 5秒内有读数视为有效
+#define BLE_SCALE_RETRY_DELAY_MS 1000     // 本机失败后的基础重试间隔
 
 // ---------- A33E Modbus-RTU ----------
 static const uint8_t  A33E_SLAVE_ID = 1;
-static const uint16_t A33E_REG_GROSS = 8;
+static const uint16_t A33E_REG_NET = 6;    // A33E手册：保持寄存器6=净重(float)，8=毛重(float)
 static const uint16_t A33E_REG_COUNT = 2;
+
+#ifndef A33E_SWAP_WORDS
+#define A33E_SWAP_WORDS 0                 // 现场若确认是CDAB字序再改为1
+#endif
 
 // ---------- 状态(任务内部用) ----------
 static BLEClient*               btClient = nullptr;
@@ -59,6 +63,9 @@ static BLERemoteService*        btService = nullptr;
 static BLERemoteCharacteristic* btWrite = nullptr;
 static BLERemoteCharacteristic* btNotify = nullptr;
 static bool     btConnected = false;
+static bool     btLeaseActive = false;
+static uint32_t btConnectedAtMs = 0;
+static volatile uint32_t btNextAttemptMs = 0;
 
 // ---------- 与主循环共享的数据(原子读写, float/uint32 在 ESP32 上原子) ----------
 static volatile float    btCurrentWeight = 0.0f;
@@ -72,6 +79,13 @@ static volatile bool     btEnabled = true;
 static uint8_t  btRxbuf[32];
 static size_t   btRxlen = 0;
 static uint32_t btRxLastMs = 0;
+static portMUX_TYPE btRxMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void btClearRx() {
+    portENTER_CRITICAL(&btRxMux);
+    btRxlen = 0;
+    portEXIT_CRITICAL(&btRxMux);
+}
 
 // ---------- Modbus CRC16 ----------
 static uint16_t btModbusCRC16(const uint8_t* data, size_t len) {
@@ -84,14 +98,14 @@ static uint16_t btModbusCRC16(const uint8_t* data, size_t len) {
     return crc;
 }
 
-// ---------- 构造并发送读毛重请求 ----------
-static void btSendReadGross() {
+// ---------- 构造并发送读净重请求 ----------
+static void btSendReadNet() {
     if (!btConnected || !btWrite) return;
     uint8_t cmd[8];
     cmd[0] = A33E_SLAVE_ID;
     cmd[1] = 0x03;
-    cmd[2] = (A33E_REG_GROSS >> 8) & 0xFF;
-    cmd[3] = A33E_REG_GROSS & 0xFF;
+    cmd[2] = (A33E_REG_NET >> 8) & 0xFF;
+    cmd[3] = A33E_REG_NET & 0xFF;
     cmd[4] = (A33E_REG_COUNT >> 8) & 0xFF;
     cmd[5] = A33E_REG_COUNT & 0xFF;
     uint16_t crc = btModbusCRC16(cmd, 6);
@@ -102,23 +116,59 @@ static void btSendReadGross() {
 
 // ---------- 解析一帧 ----------
 static bool btTryParseFrame() {
-    if (btRxlen < 9) return false;
+    uint8_t rx[sizeof(btRxbuf)];
+    size_t rxlen = 0;
+    portENTER_CRITICAL(&btRxMux);
+    rxlen = btRxlen;
+    memcpy(rx, btRxbuf, rxlen);
+    portEXIT_CRITICAL(&btRxMux);
+
+    if (rxlen < 5) return false;
+
+    // Modbus异常响应：站号 + (功能码|0x80) + 异常码 + CRC
+    for (size_t i = 0; i + 5 <= rxlen; ++i) {
+        if (rx[i] == A33E_SLAVE_ID && rx[i + 1] == (0x03 | 0x80)) {
+            uint16_t crcCalc = btModbusCRC16(&rx[i], 3);
+            uint16_t crcRcvd = rx[i + 3] | (rx[i + 4] << 8);
+            if (crcCalc == crcRcvd) {
+                btErrCount++;
+                Serial.printf("[BleScale] Modbus异常码=0x%02X\n", rx[i + 2]);
+                btClearRx();
+            }
+            return false;
+        }
+    }
+
+    if (rxlen < 9) return false;
     int start = -1;
-    for (size_t i = 0; i + 9 <= btRxlen; ++i) {
-        if (btRxbuf[i] == A33E_SLAVE_ID && btRxbuf[i+1] == 0x03 && btRxbuf[i+2] == 0x04) {
+    for (size_t i = 0; i + 9 <= rxlen; ++i) {
+        if (rx[i] == A33E_SLAVE_ID && rx[i+1] == 0x03 && rx[i+2] == 0x04) {
             start = (int)i; break;
         }
     }
     if (start < 0) return false;
-    uint8_t* f = &btRxbuf[start];
+    uint8_t* f = &rx[start];
     uint16_t crcCalc = btModbusCRC16(f, 7);
     uint16_t crcRcvd = f[7] | (f[8] << 8);
-    if (crcRcvd != crcCalc) return false;
+    if (crcRcvd != crcCalc) {
+        btErrCount++;
+        btClearRx();
+        return false;
+    }
+#if A33E_SWAP_WORDS
+    uint32_t raw = ((uint32_t)f[5] << 24) | ((uint32_t)f[6] << 16) |
+                   ((uint32_t)f[3] << 8) | (uint32_t)f[4];
+#else
     uint32_t raw = ((uint32_t)f[3] << 24) | ((uint32_t)f[4] << 16) |
                    ((uint32_t)f[5] << 8) | (uint32_t)f[6];
+#endif
     float val;
     memcpy(&val, &raw, 4);
-    if (isnan(val) || isinf(val)) return false;
+    if (isnan(val) || isinf(val) || fabsf(val) > 1000000000.0f) {
+        btErrCount++;
+        btClearRx();
+        return false;
+    }
     btCurrentWeight = val;
     btLastRecvMs = millis();
     btOkCount++;
@@ -127,9 +177,11 @@ static bool btTryParseFrame() {
 
 // ---------- Notify 回调(BLE 栈上下文, 只填缓冲) ----------
 static void btNotifyCallback(BLERemoteCharacteristic* c, uint8_t* data, size_t len, bool isNotify) {
+    portENTER_CRITICAL(&btRxMux);
     for (size_t i = 0; i < len && btRxlen < sizeof(btRxbuf); ++i)
         btRxbuf[btRxlen++] = data[i];
     btRxLastMs = millis();
+    portEXIT_CRITICAL(&btRxMux);
 }
 
 // ---------- 连接 ----------
@@ -144,9 +196,34 @@ static bool btConnectByAddr(BLEAddress addr) {
     if (!btWrite || !btNotify) { btClient->disconnect(); btConnected = false; return false; }
     if (btNotify->canNotify()) btNotify->registerForNotify(btNotifyCallback);
     btConnected = true;
-    btRxlen = 0;
+    btConnectedAtMs = millis();
+    btLastRecvMs = 0;
+    btClearRx();
     Serial.printf("[BleScale] ✅ 已连接 %s\n", BLE_SCALE_DEVICE_NAME);
     return true;
+}
+
+static void btDisconnectAndRelease(const char* reason) {
+    if (btClient && btClient->isConnected()) btClient->disconnect();
+    btConnected = false;
+    btConnectedAtMs = 0;
+    btLastRecvMs = 0;
+    btWrite = btNotify = nullptr;
+    btService = nullptr;
+    btClearRx();
+    if (btLeaseActive) {
+        btLeaseActive = false;
+        EspnowMesh_SetLocalBleConnected(false);
+    }
+    if (reason) Serial.printf("[BleScale] %s\n", reason);
+}
+
+static uint32_t btElectionDelayMs() {
+    uint8_t binId = myBinIdForBle;
+    if (binId < 1 || binId > BIN_COUNT) binId = BIN_COUNT;
+    uint64_t chipId = ESP.getEfuseMac();
+    uint32_t jitter = (uint32_t)(chipId ^ (chipId >> 32)) % 350U;
+    return 500U + (uint32_t)(binId - 1U) * 900U + jitter;
 }
 
 // ============================================================
@@ -154,79 +231,93 @@ static bool btConnectByAddr(BLEAddress addr) {
 // ============================================================
 static void bleScaleTask(void* arg) {
     uint32_t lastSend = 0;
-
-    // ---- 角色判定: 仓号最小的屏才有资格连BLE, 其他屏永不主动连 ----
-    // 这样彻底避免多台同时抢连的竞态, 也避免BLE射频争抢导致ESP-NOW掉线。
-    // 仓号最小的屏若离线, 其他屏通过 gRemoteBleActive 超时后才有资格接管(下方处理)。
-    // 简化版: 直接用本机仓号判断, 1号最高优先级。
-    bool iAmCandidate = (myBinIdForBle == 1);  // 只有1号机主动连
-    Serial.printf("[BleScale] 本机仓号=%d, %s主动连BLE\n",
-                  myBinIdForBle, iAmCandidate ? "有资格" : "无资格(只接收共享重量)");
+    Serial.printf("[BleScale] 本机仓号=%d, 已加入BLE自动接管竞选\n", myBinIdForBle);
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(50));
 
-        if (!btEnabled) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+        if (!btEnabled) {
+            if (btConnected || btLeaseActive) btDisconnectAndRelease("BLE已禁用，释放称重租约");
+            btNextAttemptMs = 0;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
 
-        // ---- 如果已有其他屏连上BLE, 本机绝不连(无论自己是不是候选) ----
+        uint32_t now = millis();
+
+        // 已有有效远程租约：未拿到数据的本机必须让出；若双方同时成功则按仓号+MAC裁决。
         if (EspnowMesh_RemoteBleActive()) {
-            if (btConnected) {
-                btClient->disconnect();
-                btConnected = false;
-                EspnowMesh_SetLocalBleConnected(false);
-                Serial.println("[BleScale] 其他屏已连BLE, 本机断开让出");
+            bool localDataValid = btLeaseActive && btLastRecvMs > 0 &&
+                                  (now - btLastRecvMs < BLE_SCALE_DATA_VALID_MS);
+            if (!localDataValid || EspnowMesh_RemoteBleWinsTie()) {
+                if (btConnected || btLeaseActive)
+                    btDisconnectAndRelease("其他屏持有有效称重租约，本机让出");
+                btNextAttemptMs = 0;
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
             }
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            continue;
         }
 
-        // ---- 不是候选机(仓号非最小) → 永不主动连, 只等共享重量 ----
-        if (!iAmCandidate) {
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            continue;
-        }
-
-        // ---- 候选机且无人占用BLE → 尝试连接 ----
+        // 无远程租约时所有设备都参与；仓号+芯片ID错峰，先成功者用心跳阻止后续抢连。
         if (!btConnected) {
-            Serial.println("[BleScale] 本机为候选, 尝试连接(MAC直连)...");
+            if (btNextAttemptMs == 0) {
+                uint32_t delayMs = btElectionDelayMs();
+                btNextAttemptMs = now + delayMs;
+                Serial.printf("[BleScale] 无有效租约，%ums后尝试接管\n", delayMs);
+            }
+            if ((int32_t)(now - btNextAttemptMs) < 0) continue;
+            btNextAttemptMs = 0;
+            Serial.println("[BleScale] 尝试连接称重模块(MAC直连)...");
             btWrite = btNotify = nullptr;
             btService = nullptr;
-            btRxlen = 0;
+            btClearRx();
             btConnectByAddr(BLEAddress(BLE_SCALE_DEVICE_MAC));
             if (btConnected) {
-                EspnowMesh_SetLocalBleConnected(true);
-                Serial.println("[BleScale] ✅ 本机已连上, 广播通知其他屏");
+                lastSend = 0;
+                Serial.println("[BleScale] GATT已连接，等待首个有效净重后再广播占用");
             } else {
-                Serial.println("[BleScale] 连接失败, 5秒后重试");
-                vTaskDelay(pdMS_TO_TICKS(5000));
+                btNextAttemptMs = millis() + BLE_SCALE_RETRY_DELAY_MS + btElectionDelayMs();
+                Serial.println("[BleScale] 连接失败，进入错峰重试");
             }
             continue;
         }
 
         // ---- 连接丢失检测 ----
         if (!btClient || !btClient->isConnected()) {
-            btConnected = false;
-            EspnowMesh_SetLocalBleConnected(false);
-            btWrite = btNotify = nullptr;
-            btService = nullptr;
-            btRxlen = 0;
-            Serial.println("[BleScale] 连接丢失, 释放BLE占用");
+            btDisconnectAndRelease("BLE物理连接丢失，已广播释放");
+            btNextAttemptMs = 0;
             continue;
         }
 
-        uint32_t now = millis();
-        if (btRxlen > 0 && now - btRxLastMs > BLE_SCALE_RESYNC_MS) btRxlen = 0;
+        now = millis();
+        if (btRxlen > 0 && now - btRxLastMs > BLE_SCALE_RESYNC_MS) btClearRx();
+
+        bool noFirstData = btLastRecvMs == 0 && now - btConnectedAtMs >= BLE_SCALE_DATA_VALID_MS;
+        bool dataExpired = btLastRecvMs > 0 && now - btLastRecvMs >= BLE_SCALE_DATA_VALID_MS;
+        if (noFirstData || dataExpired) {
+            btDisconnectAndRelease(noFirstData ?
+                "连接后始终未收到A33E净重，释放并重试" :
+                "A33E净重数据超时，释放并重试");
+            btNextAttemptMs = 0;
+            continue;
+        }
+
         if (now - lastSend >= BLE_SCALE_READ_INTERVAL_MS) {
             lastSend = now;
-            btRxlen = 0;
-            btSendReadGross();
+            btClearRx();
+            btSendReadNet();
         }
         if (btTryParseFrame()) {
-            btRxlen = 0;
+            btClearRx();
+            if (!btLeaseActive) {
+                btLeaseActive = true;
+                EspnowMesh_SetLocalBleConnected(true);
+                Serial.println("[BleScale] ✅ 首个有效净重已收到，广播称重租约");
+            }
             uint32_t ok = btOkCount;
             float w = btCurrentWeight;
             if (ok == 1 || ok % 10 == 0)
-                Serial.printf("[BleScale] 毛重=%.3f kg (第%u次)\n", w, ok);
+                Serial.printf("[BleScale] 净重=%.3f kg (第%u次)\n", w, ok);
         }
     }
 }
@@ -234,7 +325,10 @@ static void bleScaleTask(void* arg) {
 // ============================================================
 //  对外接口
 // ============================================================
-inline void BleScale_SetMyBinId(uint8_t binId) { myBinIdForBle = binId; }
+inline void BleScale_SetMyBinId(uint8_t binId) {
+    myBinIdForBle = binId;
+    btNextAttemptMs = 0;  // 仓号变化后重新计算错峰优先级
+}
 
 inline void BleScale_Init() {
     Serial.printf("[BleScale] 启动 BLE 任务, 目标: %s [%s]\n",
@@ -244,7 +338,7 @@ inline void BleScale_Init() {
     xTaskCreatePinnedToCore(bleScaleTask, "bleScale", 8192, nullptr, 1, nullptr, 1);
 }
 
-// 主循环调用: 返回最新毛重。fallback=无有效读数时的回退值
+// 主循环调用: 返回最新净重。fallback=无有效读数时的安全回退值
 // 优先级: 本机BLE读数 > 其他屏共享的BLE重量 > 回退值
 inline float BleScale_Loop(float fallbackWeight) {
     if (!btEnabled) return fallbackWeight;

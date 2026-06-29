@@ -7,7 +7,6 @@
 
 static uint32_t lastLvTick = 0;
 static bool selfTestDone = false;
-static float simFallbackWeight = 0.0f;  // BLE断连时的回退重量(0kg)
 
 // ESP-NOW 收到某仓状态变化 → 通知Display更新对应灯
 void onBinStateChange(uint8_t binId, bool online, float binWeight, float currentWeight) {
@@ -48,7 +47,7 @@ void setup() {
         EspnowMesh_AnnounceOnline(Display_GetBinWeight(), Display_GetCurrentWeight(), 5, 40);
     }
 
-    // 3. 蓝牙称重: 启用 BLE 读 A33E 毛重
+    // 3. 蓝牙称重: 启用 BLE 读 A33E 净重
     BleScale_Init();
 
     lastLvTick = millis();
@@ -68,14 +67,8 @@ void loop() {
         selfTestDone = true;
     }
 
-    // 模拟称重更新 (200ms间隔, 正弦波动)
-    if (now - lastSimUpdate >= SIM_UPDATE_MS) {
-        lastSimUpdate = now;
-        simFallbackWeight = 25.0f + 4.0f * sinf(now / 1600.0f);
-    }
-
-    // 蓝牙读真实重量 (优先), 断连时回退到 simFallbackWeight(0kg)
-    float currentWeight = BleScale_Loop(simFallbackWeight);
+    // 只显示真实净重。无本地/远程有效读数时安全回退为0，不再广播模拟重量。
+    float currentWeight = BleScale_Loop(0.0f);
 
     // 更新 Display 当前称重
     Display_SetCurrentWeight(currentWeight);
