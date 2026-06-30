@@ -14,15 +14,24 @@
 
 static constexpr uint8_t ESPNOW_CHANNEL = 6;
 static constexpr uint8_t ESPNOW_BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-static constexpr uint32_t WEIGHT_BROADCAST_INTERVAL_MS = 2000;
+static constexpr uint32_t WEIGHT_BROADCAST_INTERVAL_MS = 3500;  // 降射频发热: 2s→3.5s
 static constexpr uint32_t DEVICE_OFFLINE_TIMEOUT_MS = 6000;
 static constexpr uint32_t MASTER_OFFLINE_TIMEOUT_MS = 6000;
 
 static constexpr uint32_t MASTER_WEIGHT_MAGIC = 0xA33E1001;
 static constexpr uint32_t FOLLOWER_ACK_MAGIC = 0xA33E1002;
-static constexpr uint32_t BIN_WEIGHT_SYNC_MAGIC = 0xA33E0002;
 static constexpr uint32_t MASTER_SELECT_MAGIC = 0xA33E1003;
+static constexpr uint32_t BIN_EVENT_MAGIC = 0xA33E2001;
 static constexpr uint8_t ESPNOW_PROTOCOL_VERSION = 2;
+
+// 事件类型枚举
+enum BinEventType : uint8_t {
+    BIN_EVENT_LOAD = 1,      // 上料
+    BIN_EVENT_UNLOAD = 2,    // 下料
+    BIN_EVENT_EDIT = 3,      // 编辑仓重
+    BIN_EVENT_ONLINE = 4,    // 上线
+    BIN_EVENT_OFFLINE = 5    // 掉线
+};
 
 #pragma pack(push, 1)
 struct MasterWeightPacket {
@@ -46,10 +55,15 @@ struct FollowerAckPacket {
     uint32_t masterEpoch;
 };
 
-struct BinWeightSyncPacket {
+struct BinEventPacket {
     uint32_t magic;
-    uint8_t binId;
-    float weight;
+    uint8_t version;
+    uint8_t eventType;     // BinEventType
+    uint8_t sourceBin;     // 事件发生的仓号 1-6
+    uint8_t reporterBin;   // 实际广播的仓号 1-6
+    float deltaG;          // load+ / unload- / 其它=0
+    float newValue;        // edit=新仓重 / 其它=0
+    uint32_t seq;          // 每源仓递增, 供云端去重排序
 };
 
 struct MasterSelectPacket {
@@ -100,19 +114,19 @@ inline volatile uint32_t pendingMasterEpoch = 0;
 inline volatile bool onlineMaskPending = false;
 inline volatile uint8_t pendingOnlineMask = 0;
 inline volatile float pendingOnlineWeight = 0.0f;
-inline volatile bool binWeightSyncPending = false;
-inline volatile uint8_t pendingSyncBin = 0;
-inline volatile float pendingSyncWeight = 0.0f;
+inline volatile bool binEventPending = false;
+inline BinEventPacket pendingBinEvent{};
+inline uint32_t eventSeqPerBin[BIN_COUNT] = {0, 0, 0, 0, 0, 0};
 inline portMUX_TYPE meshMux = portMUX_INITIALIZER_UNLOCKED;
 
 typedef void (*OnBinStateChangeCb)(uint8_t binId, bool online, float binWeight, float currentWeight);
-typedef void (*OnBinWeightSyncCb)(uint8_t binId, float weight);
+typedef void (*OnBinEventCb)(const BinEventPacket&);
 typedef void (*OnSilenceCb)(bool silent);
 typedef void (*OnRemoteBleCb)(bool remoteBleConnected, float weight);
 typedef void (*OnMasterSelectionCb)(uint8_t masterBin, uint32_t masterEpoch);
 
 inline OnBinStateChangeCb gOnBinStateCb = nullptr;
-inline OnBinWeightSyncCb gOnBinWeightSyncCb = nullptr;
+inline OnBinEventCb gOnBinEventCb = nullptr;
 inline OnSilenceCb gOnSilenceCb = nullptr;
 inline OnRemoteBleCb gOnRemoteBleCb = nullptr;
 inline OnMasterSelectionCb gOnMasterSelectionCb = nullptr;
@@ -122,7 +136,7 @@ inline bool EspnowMesh_IsMaster() {
 }
 
 inline void EspnowMesh_SetStateCallback(OnBinStateChangeCb cb) { gOnBinStateCb = cb; }
-inline void EspnowMesh_SetWeightSyncCallback(OnBinWeightSyncCb cb) { gOnBinWeightSyncCb = cb; }
+inline void EspnowMesh_SetBinEventCallback(OnBinEventCb cb) { gOnBinEventCb = cb; }
 inline void EspnowMesh_SetSilenceCallback(OnSilenceCb cb) { gOnSilenceCb = cb; }
 inline void EspnowMesh_SetRemoteBleCallback(OnRemoteBleCb cb) { gOnRemoteBleCb = cb; }
 inline void EspnowMesh_SetMasterSelectionCallback(OnMasterSelectionCb cb) { gOnMasterSelectionCb = cb; }
@@ -140,6 +154,7 @@ inline void EspnowMesh_SetMasterSelection(uint8_t masterBin, uint32_t masterEpoc
 }
 
 inline uint8_t EspnowMesh_GetMasterBin() { return selectedMasterBin; }
+inline uint8_t EspnowMesh_GetMyBin() { return myBinId; }
 inline uint32_t EspnowMesh_GetMasterEpoch() { return selectedMasterEpoch; }
 
 inline bool EspnowMesh_RemoteBleActive() {
@@ -172,7 +187,10 @@ inline uint8_t EspnowMesh_BuildOnlineMask(uint32_t now) {
     return mask;
 }
 
+inline void EspnowMesh_BroadcastBinEvent(uint8_t eventType, float deltaG, float newValue, uint8_t sourceBin);
+
 inline void EspnowMesh_ApplyOnlineMask(uint8_t mask, float currentWeight) {
+    bool isMaster = EspnowMesh_IsMaster();
     for (uint8_t i = 0; i < BIN_COUNT; ++i) {
         bool next = (mask & (1U << i)) != 0;
         bool changed = binStates[i].online != next;
@@ -181,6 +199,11 @@ inline void EspnowMesh_ApplyOnlineMask(uint8_t mask, float currentWeight) {
         binStates[i].currentWeight = currentWeight;
         if (changed && gOnBinStateCb)
             gOnBinStateCb(i + 1, next, binStates[i].binWeight, currentWeight);
+        // 主机统一在位图变化时广播 online/offline 事件, 供仓1(DTU节点)上报。
+        if (changed && isMaster && meshInitialized && (i + 1) != myBinId) {
+            EspnowMesh_BroadcastBinEvent(next ? BIN_EVENT_ONLINE : BIN_EVENT_OFFLINE,
+                                         0.0f, 0.0f, static_cast<uint8_t>(i + 1));
+        }
     }
     lastOnlineMask = mask;
 }
@@ -216,11 +239,29 @@ inline void EspnowMesh_AnnounceOnline(float binWeight, float currentWeight, uint
     lastWeightBroadcastMs = millis();
 }
 
-inline void EspnowMesh_BroadcastBinWeightSync(uint8_t binId, float weight) {
-    if (!meshInitialized || binId < 1 || binId > BIN_COUNT) return;
-    BinWeightSyncPacket pkt{BIN_WEIGHT_SYNC_MAGIC, binId, weight};
+// 广播一个仓变化事件(load/unload/edit/online/offline)。
+// 本机广播后立即本地回调一次, 确保仓1(DTU节点)是事件源时也能上报自己的事件
+// (ESP-NOW 会过滤自己 MAC 的包)。
+inline void EspnowMesh_BroadcastBinEvent(uint8_t eventType, float deltaG, float newValue, uint8_t sourceBin) {
+    if (!meshInitialized || sourceBin < 1 || sourceBin > BIN_COUNT) return;
+    BinEventPacket pkt{};
+    pkt.magic = BIN_EVENT_MAGIC;
+    pkt.version = ESPNOW_PROTOCOL_VERSION;
+    pkt.eventType = eventType;
+    pkt.sourceBin = sourceBin;
+    pkt.reporterBin = myBinId;
+    pkt.deltaG = deltaG;
+    pkt.newValue = newValue;
+    pkt.seq = ++eventSeqPerBin[sourceBin - 1];
     esp_now_send(ESPNOW_BROADCAST_MAC, reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
-    Serial.printf("[ESPNOW] 仓重同步广播: 仓%d → %.1f kg\n", binId, weight);
+    // 本机直接回调: 仓1作为DTU节点时会由此上报自己的事件; 主机自己产生的事件也走这条。
+    if (gOnBinEventCb) gOnBinEventCb(pkt);
+    if (eventType == BIN_EVENT_LOAD || eventType == BIN_EVENT_UNLOAD || eventType == BIN_EVENT_EDIT) {
+        Serial.printf("[ESPNOW] 事件广播: type=%u 仓%d delta=%.2f newVal=%.2f seq=%u\n",
+                      eventType, sourceBin, deltaG, newValue, pkt.seq);
+    } else {
+        Serial.printf("[ESPNOW] 事件广播: type=%u 仓%d seq=%u\n", eventType, sourceBin, pkt.seq);
+    }
 }
 
 inline void EspnowMesh_BroadcastMasterSelection(uint8_t masterBin, uint32_t masterEpoch) {
@@ -309,14 +350,15 @@ inline void onEspNowRecv(const uint8_t* macAddr, const uint8_t* data, int len) {
         return;
     }
 
-    if (magic == BIN_WEIGHT_SYNC_MAGIC && len == static_cast<int>(sizeof(BinWeightSyncPacket))) {
-        BinWeightSyncPacket pkt{};
+    if (magic == BIN_EVENT_MAGIC && len == static_cast<int>(sizeof(BinEventPacket))) {
+        BinEventPacket pkt{};
         memcpy(&pkt, data, sizeof(pkt));
-        if (pkt.binId < 1 || pkt.binId > BIN_COUNT) return;
+        if (pkt.version != ESPNOW_PROTOCOL_VERSION) return;
+        if (pkt.sourceBin < 1 || pkt.sourceBin > BIN_COUNT) return;
+        // 任何设备(尤其固定接DTU的仓1)收到事件包即置pending, 由主循环回调上报。
         portENTER_CRITICAL(&meshMux);
-        pendingSyncBin = pkt.binId;
-        pendingSyncWeight = pkt.weight;
-        binWeightSyncPending = true;
+        pendingBinEvent = pkt;
+        binEventPending = true;
         portEXIT_CRITICAL(&meshMux);
         return;
     }
@@ -337,6 +379,9 @@ inline bool EspnowMesh_Init() {
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
+    // 降射频发热: 默认20dBm满功率, 同房间6台互发只需低功率。
+    // 8dBm 足以覆盖现场距离, 显著降低芯片功耗与发热。
+    esp_wifi_set_max_tx_power(80);  // 单位1/4 dBm, 80=8dBm
     WiFi.macAddress(myMac);
 
     if (esp_now_init() != ESP_OK) return false;
@@ -386,24 +431,19 @@ inline void EspnowMesh_ProcessPendingUi() {
     bool hasMask;
     uint8_t mask;
     float weight;
-    bool hasSync;
-    uint8_t syncBin;
-    float syncWeight;
+    bool hasEvent;
+    BinEventPacket evt{};
     portENTER_CRITICAL(&meshMux);
     hasMask = onlineMaskPending;
     mask = pendingOnlineMask;
     weight = pendingOnlineWeight;
     onlineMaskPending = false;
-    hasSync = binWeightSyncPending;
-    syncBin = pendingSyncBin;
-    syncWeight = pendingSyncWeight;
-    binWeightSyncPending = false;
+    hasEvent = binEventPending;
+    evt = pendingBinEvent;
+    binEventPending = false;
     portEXIT_CRITICAL(&meshMux);
     if (hasMask) EspnowMesh_ApplyOnlineMask(mask, weight);
-    if (hasSync && syncBin >= 1 && syncBin <= BIN_COUNT) {
-        binStates[syncBin - 1].binWeight = syncWeight;
-        if (gOnBinWeightSyncCb) gOnBinWeightSyncCb(syncBin, syncWeight);
-    }
+    if (hasEvent && gOnBinEventCb) gOnBinEventCb(evt);
 }
 
 inline void EspnowMesh_SendPendingAck(uint32_t now) {

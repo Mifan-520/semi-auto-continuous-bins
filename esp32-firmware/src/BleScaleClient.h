@@ -46,7 +46,7 @@ static BLEUUID BLE_SCALE_NOTIFY_UUID ("0000ffe2-0000-1000-8000-00805f9b34fb");
 
 // ---------- 节奏 ----------
 #ifndef BLE_SCALE_READ_INTERVAL_MS
-#define BLE_SCALE_READ_INTERVAL_MS 2000   // 每2秒读取一次A33E净重
+#define BLE_SCALE_READ_INTERVAL_MS 3500   // 降功耗: 每3.5秒读取一次A33E净重
 #endif
 #define BLE_SCALE_RESYNC_MS 400           // 残包超时
 #define BLE_SCALE_DATA_VALID_MS 5000      // 5秒内有读数视为有效

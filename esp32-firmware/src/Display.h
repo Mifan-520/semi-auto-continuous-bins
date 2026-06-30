@@ -51,6 +51,7 @@ inline float binWeights[BIN_COUNT] = {45.0f, 30.0f, 50.0f, 20.0f, 60.0f, 35.0f};
 inline uint8_t localBin = 0;           // 本机仓号 0-5 (默认仓1)
 inline uint8_t masterBin = 2;          // 主机仓号 0-5 (默认仓3)
 inline uint32_t masterEpoch = 1;       // 手动改换主机时递增，防止旧配置复活
+inline bool dtuEnabled = false;        // 本机是否为DTU节点(物理接DTU的那台); 与仓号/主从解耦
 inline float simCurrentWeight = 0.0f;
 inline bool online = false;           // 在线状态 (ESP-NOW初始化后设true)
 inline bool scaleDataOnline = false;   // 是否正在收到有效净重；离线时瞬时重量显示0
@@ -60,6 +61,7 @@ inline volatile bool commRecoverPending = false;  // ESP-NOW回调置位, Displa
 inline volatile uint32_t restartAtMs = 0;
 inline uint32_t normalMessageUntil = 0;
 inline uint32_t lastSimUpdate = 0;
+inline uint32_t logoPressStartMs = 0;   // 长按logo计时起点(开发者模式需按住5秒)
 
 // 6仓在线表 (全部默认灰色, 上线后才变绿)
 inline bool binOnline[BIN_COUNT] = {false, false, false, false, false, false};
@@ -78,6 +80,7 @@ inline void nvsSaveBinWeights() {
     prefs.putUChar("localBin", localBin);
     prefs.putUChar("masterBin", masterBin);
     prefs.putUInt("masterEpoch", masterEpoch);
+    prefs.putBool("dtuEn", dtuEnabled);
     prefs.end();
     Serial.println("[NVS] 仓重已保存");
 }
@@ -93,6 +96,7 @@ inline void nvsLoadBinWeights() {
     localBin = prefs.getUChar("localBin", localBin);
     masterBin = prefs.getUChar("masterBin", masterBin);
     masterEpoch = prefs.getUInt("masterEpoch", masterEpoch);
+    dtuEnabled = prefs.getBool("dtuEn", false);
     if (localBin >= BIN_COUNT) localBin = 0;
     if (masterBin >= BIN_COUNT) masterBin = 2;
     if (masterEpoch == 0) masterEpoch = 1;
@@ -235,6 +239,7 @@ inline void confirmEvent(lv_event_t* e) {
         nvsSaveBinWeights();
         updateWeights();
         showMessage("上料完毕", false, false);
+        EspnowMesh_BroadcastBinEvent(BIN_EVENT_LOAD, simCurrentWeight, 0.0f, b + 1);
     } else if (op && strcmp(op, "unload") == 0) {
         if (binWeights[b] < simCurrentWeight) {
             Serial.printf("[EVENT] 下料失败: 仓%d %.1f < 当前 %.1f\n", b + 1, binWeights[b], simCurrentWeight);
@@ -246,6 +251,7 @@ inline void confirmEvent(lv_event_t* e) {
             nvsSaveBinWeights();
             updateWeights();
             showMessage("下料完毕", false, false);
+            EspnowMesh_BroadcastBinEvent(BIN_EVENT_UNLOAD, -simCurrentWeight, 0.0f, b + 1);
         }
     }
     closeModal();
@@ -413,8 +419,8 @@ inline void showEditConfirmDialog(float newWeight) {
         closeEditPanel();
         // 立即广播本机仓更新(心跳)
         EspnowMesh_BroadcastHeartbeat(binWeights[localBin], simCurrentWeight);
-        // 广播仓重同步到所有设备 (为后续DTU上报铺垫)
-        EspnowMesh_BroadcastBinWeightSync(localBin + 1, val);
+        // 广播编辑事件(只报新值), 供仓1(DTU节点)上报
+        EspnowMesh_BroadcastBinEvent(BIN_EVENT_EDIT, 0.0f, val, localBin + 1);
         showMessage("修改完毕", false, false);
     }, LV_EVENT_CLICKED, nullptr);
 }
@@ -586,6 +592,18 @@ inline void devMasterSelectEvent(lv_event_t* e) {
     restartAtMs = millis() + 700;
 }
 
+// 开发者模式: 切换本机DTU节点开关。物理接DTU的那台勾开, 其余保持关。
+// 与仓号/主从角色完全解耦, 任意仓被勾开都可作为DTU上报出口。
+inline void devDtuToggleEvent(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    dtuEnabled = !dtuEnabled;
+    nvsSaveBinWeights();
+    Serial.printf("[EVENT] 开发者模式: DTU节点 → %s, 准备重启\n", dtuEnabled ? "开" : "关");
+    // DTU身份改变后需重启, 让 setup 按 dtuEnabled 决定是否初始化Serial1。
+    closeModal();
+    restartAtMs = millis() + 600;
+}
+
 inline void showDevBinDialog() {
     closeModal();
     modal = lv_obj_create(lv_scr_act());
@@ -596,7 +614,7 @@ inline void showDevBinDialog() {
     lv_obj_add_event_cb(modal, modalCloseEvent, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t* box = lv_obj_create(modal);
-    lv_obj_set_size(box, 450, 292);
+    lv_obj_set_size(box, 450, 332);
     lv_obj_center(box);
     lv_obj_set_style_radius(box, 12, 0);
     lv_obj_set_style_bg_color(box, C(CLR_PANEL), 0);
@@ -670,12 +688,35 @@ inline void showDevBinDialog() {
         lv_obj_center(bl);
     }
 
+    // DTU 节点开关: 物理接DTU串口的那台勾开, 与仓号/主从解耦。
+    lv_obj_t* dtuTitle = makeLabel(box, "DTU", &lv_font_chinese_14, C(CLR_TEXT));
+    lv_obj_align(dtuTitle, LV_ALIGN_TOP_LEFT, 14, 210);
+    lv_obj_t* dtuBtn = lv_btn_create(box);
+    lv_obj_set_size(dtuBtn, 80, 36);
+    lv_obj_set_style_radius(dtuBtn, 6, 0);
+    lv_obj_set_style_bg_color(dtuBtn, C(dtuEnabled ? CLR_GREEN : CLR_GRAY), 0);
+    lv_obj_set_style_border_width(dtuBtn, 0, 0);
+    lv_obj_set_style_shadow_width(dtuBtn, 0, 0);
+    lv_obj_align(dtuBtn, LV_ALIGN_TOP_RIGHT, -14, 206);
+    lv_obj_add_event_cb(dtuBtn, devDtuToggleEvent, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* dtuLbl = makeLabel(dtuBtn, dtuEnabled ? "开" : "关",
+                                 &lv_font_chinese_14, lv_color_white());
+    lv_obj_center(dtuLbl);
+
 }
 
-inline void logoEvent(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
-    Serial.println("[EVENT] 长按logo: 进入开发者模式(本机仓号/主机仓号)");
-    showDevBinDialog();
+// 长按logo 5秒进入开发者模式。用自己计时取代LVGL默认400ms长按,
+// 避免误触; 同时禁用logo默认的长按事件避免重复触发。
+inline void logoPressedEvent(lv_event_t* e) {
+    if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+        logoPressStartMs = millis();
+    } else if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+        if (logoPressStartMs > 0 && millis() - logoPressStartMs >= 5000) {
+            Serial.println("[EVENT] 长按logo 5秒: 进入开发者模式");
+            showDevBinDialog();
+        }
+        logoPressStartMs = 0;
+    }
 }
 
 // ===== 触摸 =====
@@ -770,6 +811,7 @@ inline float Display_GetCurrentWeight() { return simCurrentWeight; }
 inline uint8_t Display_GetLocalBinId() { return localBin + 1; }
 inline uint8_t Display_GetMasterBinId() { return masterBin + 1; }
 inline uint32_t Display_GetMasterEpoch() { return masterEpoch; }
+inline bool Display_IsDtuEnabled() { return dtuEnabled; }
 inline void Display_SetCurrentWeight(float w) { simCurrentWeight = w; updateWeights(); }
 
 // 有效净重断联时只把瞬时重量置0；binWeights[]累计仓重绝不清零。
@@ -801,16 +843,6 @@ inline void Display_OnBinStateChange(uint8_t binId, bool isBinOnline, float binW
     // 六仓小灯与净重有效状态分离：其他节点在线不能掩盖称重链路离线告警。
     Serial.printf("[Display] 仓%d %s (重量%.1f)\n", binId, isBinOnline ? "上线" : "离线", binWeight);
     updateBinDots();
-}
-
-// ESP-NOW 收到仓重同步包 → 更新本地仓重
-inline void Display_OnBinWeightSync(uint8_t binId, float weight) {
-    if (binId < 1 || binId > BIN_COUNT) return;
-    uint8_t idx = binId - 1;
-    binWeights[idx] = weight;
-    nvsSaveBinWeights();
-    if (idx == localBin) updateWeights();
-    Serial.printf("[Display] 仓%d 重量同步: %.1f kg\n", binId, weight);
 }
 
 // ESP-NOW 全静默状态变化 (断网/恢复)
@@ -877,7 +909,10 @@ inline void buildHome() {
     lv_img_set_src(logo, &logo_roastek);
     lv_obj_align(logo, LV_ALIGN_LEFT_MID, 4, 0);
     lv_obj_add_flag(logo, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(logo, logoEvent, LV_EVENT_LONG_PRESSED, nullptr);
+    // 长按5秒进开发者模式: 自己计时(PRESSED起点/RELEASED判断), 不用LVGL默认短长按。
+    lv_obj_clear_flag(logo, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(logo, logoPressedEvent, LV_EVENT_PRESSED, nullptr);
+    lv_obj_add_event_cb(logo, logoPressedEvent, LV_EVENT_RELEASED, nullptr);
 
     // 仓号文字 (logo右侧)
     char binTitle[8];
@@ -1042,7 +1077,6 @@ inline void Display_Init() {
 
     nvsLoadBinWeights();  // 恢复上次断电前的数据
     buildHome();
-    EspnowMesh_SetWeightSyncCallback(Display_OnBinWeightSync);  // 注册仓重同步回调
     EspnowMesh_SetSilenceCallback(Display_OnSilence);           // 注册全静默回调
     Serial.println("[Display] M1 unified UI initialized");
 }

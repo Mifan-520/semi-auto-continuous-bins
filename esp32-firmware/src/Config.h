@@ -22,9 +22,11 @@ static constexpr uint8_t DEFAULT_LOCAL_ID = 1;
 static constexpr bool DEFAULT_GATEWAY_FLAG = true;
 static constexpr uint8_t FIXED_GATEWAY_ID = 1;
 
-// DTU placeholder: JSON lines will be sent on Serial1 in a later phase.
-static constexpr int DTU_TX_PIN = 32;
-static constexpr int DTU_RX_PIN = 25;
+// DTU 串口: ESP32 上报 JSON 给 DTU。
+// 接线: ESP32 GPIO25(TX,输出) → DTU RX(输入); GPIO32(RX) ← DTU TX(备用,一般不用)。
+// 命名从 ESP32 视角: TX_PIN=ESP32实际做TX输出的脚(25), RX_PIN=ESP32实际做RX输入的脚(32)。
+static constexpr int DTU_TX_PIN = 25;   // ESP32 TX 输出脚
+static constexpr int DTU_RX_PIN = 32;   // ESP32 RX 输入脚(备用)
 static constexpr uint32_t DTU_BAUD_DEFAULT = 9600;
 
 static constexpr uint32_t MESSAGE_CLEAR_MS = 5000;

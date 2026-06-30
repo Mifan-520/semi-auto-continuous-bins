@@ -15,6 +15,35 @@ void onBinStateChange(uint8_t binId, bool online, float binWeight, float current
     Display_OnBinStateChange(binId, online, binWeight, currentWeight);
 }
 
+// 事件类型 → 字符串名
+static const char* eventTypeName(uint8_t t) {
+    switch (t) {
+        case BIN_EVENT_LOAD:    return "load";
+        case BIN_EVENT_UNLOAD:  return "unload";
+        case BIN_EVENT_EDIT:    return "edit";
+        case BIN_EVENT_ONLINE:  return "online";
+        case BIN_EVENT_OFFLINE: return "offline";
+        default:                return "unknown";
+    }
+}
+
+// 收到任意仓变化事件 → DTU节点(开发者模式勾开的那台)上报JSON。
+// DTU身份与仓号/主从完全解耦, 物理接DTU串口的那台勾开即可。
+void onBinEvent(const BinEventPacket& p) {
+    if (!Display_IsDtuEnabled()) return;  // 非DTU节点不负责上报
+    char dBuf[16], nBuf[16];
+    dtostrf(p.deltaG, 0, 2, dBuf);
+    dtostrf(p.newValue, 0, 2, nBuf);
+    char json[128];
+    snprintf(json, sizeof(json),
+             "{\"reporterBin\":%u,\"sourceBin\":%u,\"eventType\":\"%s\","
+             "\"deltaG\":%s,\"newValue\":%s,\"seq\":%lu}",
+             p.reporterBin, p.sourceBin, eventTypeName(p.eventType),
+             dBuf, nBuf, (unsigned long)p.seq);
+    CloudReport_SendEventJson(json);
+    Serial.printf("[DTU] 上报: %s\n", json);
+}
+
 void setup() {
     Serial.begin(115200);
     delay(200);
@@ -48,11 +77,17 @@ void setup() {
 
     EspnowMesh_SetGateway(DEFAULT_GATEWAY_FLAG);
     EspnowMesh_SetStateCallback(onBinStateChange);
-    EspnowMesh_SetWeightSyncCallback(Display_OnBinWeightSync);
+    EspnowMesh_SetBinEventCallback(onBinEvent);
     EspnowMesh_SetSilenceCallback(Display_OnSilence);
     EspnowMesh_SetMasterSelectionCallback(Display_OnMasterSelection);
     if (!EspnowMesh_Init()) {
         Serial.println("[A33E] ESP-NOW初始化失败, 仅UI运行");
+    }
+
+    // 初始化DTU串口(GPIO25 TX → DTU RX), 仅本机被勾选为DTU节点时才初始化并上报。
+    if (Display_IsDtuEnabled()) {
+        CloudReport_Init();
+        Serial.println("[A33E] 本机为DTU节点, 已初始化DTU串口");
     }
 
     roleGraceStartedMs = millis();
