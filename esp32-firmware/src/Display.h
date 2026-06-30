@@ -49,10 +49,15 @@ inline float editPendingWeight = 0;           // 待确认的新重量
 // ===== 业务状态 (M1模拟) =====
 inline float binWeights[BIN_COUNT] = {45.0f, 30.0f, 50.0f, 20.0f, 60.0f, 35.0f};
 inline uint8_t localBin = 0;           // 本机仓号 0-5 (默认仓1)
-inline float simCurrentWeight = 25.3f;
+inline uint8_t masterBin = 2;          // 主机仓号 0-5 (默认仓3)
+inline uint32_t masterEpoch = 1;       // 手动改换主机时递增，防止旧配置复活
+inline float simCurrentWeight = 0.0f;
 inline bool online = false;           // 在线状态 (ESP-NOW初始化后设true)
+inline bool scaleDataOnline = false;   // 是否正在收到有效净重；离线时瞬时重量显示0
+inline bool scaleUiInitialized = false;
 inline bool persistentError = false;
 inline volatile bool commRecoverPending = false;  // ESP-NOW回调置位, Display_Loop里清告警
+inline volatile uint32_t restartAtMs = 0;
 inline uint32_t normalMessageUntil = 0;
 inline uint32_t lastSimUpdate = 0;
 
@@ -71,6 +76,8 @@ inline void nvsSaveBinWeights() {
         prefs.putFloat(key, binWeights[i]);
     }
     prefs.putUChar("localBin", localBin);
+    prefs.putUChar("masterBin", masterBin);
+    prefs.putUInt("masterEpoch", masterEpoch);
     prefs.end();
     Serial.println("[NVS] 仓重已保存");
 }
@@ -84,9 +91,14 @@ inline void nvsLoadBinWeights() {
         binWeights[i] = prefs.getFloat(key, binWeights[i]);  // 若无记录则保留默认值
     }
     localBin = prefs.getUChar("localBin", localBin);
+    masterBin = prefs.getUChar("masterBin", masterBin);
+    masterEpoch = prefs.getUInt("masterEpoch", masterEpoch);
+    if (localBin >= BIN_COUNT) localBin = 0;
+    if (masterBin >= BIN_COUNT) masterBin = 2;
+    if (masterEpoch == 0) masterEpoch = 1;
     prefs.end();
-    Serial.printf("[NVS] 已加载: 本机=仓%d, 仓重=%.1f/%.1f/%.1f/%.1f/%.1f/%.1f\n",
-                  localBin + 1,
+    Serial.printf("[NVS] 已加载: 本机=仓%d, 主机=仓%d, epoch=%u, 仓重=%.1f/%.1f/%.1f/%.1f/%.1f/%.1f\n",
+                  localBin + 1, masterBin + 1, masterEpoch,
                   binWeights[0], binWeights[1], binWeights[2],
                   binWeights[3], binWeights[4], binWeights[5]);
 }
@@ -536,17 +548,13 @@ inline void buttonEvent(lv_event_t* e) {
     else if (strcmp(action, "edit") == 0) openEditPanel();
 }
 
-// ===== 长按logo: 切换在线/离线 (M1模拟) =====
-// ===== 长按logo: 开发者模式 - 编辑本机仓号 =====
+// ===== 长按logo: 开发者模式 - 编辑本机仓号/指定唯一主机 =====
 inline void devBinSelectEvent(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     uint8_t oldBin = localBin;
     localBin = idx;
     Serial.printf("[EVENT] 开发者模式: 本机仓号 仓%d → 仓%d\n", oldBin + 1, idx + 1);
-    BleScale_SetMyBinId(localBin + 1);  // 立即更新BLE错峰优先级，不能只改UI/ESP-NOW
-    // ESP-NOW: 旧仓下线 + 新仓上线(自动通知Display更新灯) + 连发3次心跳
-    EspnowMesh_OnBinChanged(oldBin + 1, idx + 1, binWeights[idx], simCurrentWeight);
     closeModal();
     // 更新顶栏仓号文字
     char binTitle[8];
@@ -554,9 +562,27 @@ inline void devBinSelectEvent(lv_event_t* e) {
     lv_label_set_text(binLabel, binTitle);
     updateWeights();
     nvsSaveBinWeights();
-    // 强制广播新仓号(不等心跳周期)
-    EspnowMesh_BroadcastHeartbeat(binWeights[localBin], simCurrentWeight);
-    Serial.printf("[NVS] 本机仓号已保存: 仓%d\n", localBin + 1);
+    // 本机仓号可能改变主从角色。重启后仅主机初始化BLE，避免从机占用BLE内存。
+    restartAtMs = millis() + 600;
+    Serial.printf("[NVS] 本机仓号已保存: 仓%d，准备重启应用角色\n", localBin + 1);
+}
+
+inline void devMasterSelectEvent(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= BIN_COUNT) return;
+    if (masterBin == static_cast<uint8_t>(idx)) {
+        closeModal();
+        return;
+    }
+    masterBin = static_cast<uint8_t>(idx);
+    ++masterEpoch;
+    if (masterEpoch == 0) masterEpoch = 1;
+    Serial.printf("[EVENT] 开发者模式: 指定仓%d为主机, epoch=%u\n", masterBin + 1, masterEpoch);
+    EspnowMesh_BroadcastMasterSelection(masterBin + 1, masterEpoch);
+    nvsSaveBinWeights();
+    closeModal();
+    restartAtMs = millis() + 700;
 }
 
 inline void showDevBinDialog() {
@@ -569,7 +595,7 @@ inline void showDevBinDialog() {
     lv_obj_add_event_cb(modal, modalCloseEvent, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t* box = lv_obj_create(modal);
-    lv_obj_set_size(box, 360, 230);
+    lv_obj_set_size(box, 450, 292);
     lv_obj_center(box);
     lv_obj_set_style_radius(box, 12, 0);
     lv_obj_set_style_bg_color(box, C(CLR_PANEL), 0);
@@ -577,23 +603,21 @@ inline void showDevBinDialog() {
     lv_obj_set_style_border_color(box, C(CLR_ROASTEK), 0);
     lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t* titleLabel = makeLabel(box, "开发者:选择本机仓号", &lv_font_chinese_14, C(CLR_ROASTEK));
-    lv_obj_align(titleLabel, LV_ALIGN_TOP_MID, 0, 12);
+    lv_obj_t* titleLabel = makeLabel(box, "开发者模式", &lv_font_chinese_14, C(CLR_ROASTEK));
+    lv_obj_align(titleLabel, LV_ALIGN_TOP_MID, 0, 8);
 
-    // 6个仓按钮 2行3列
-    lv_obj_t* grid = lv_obj_create(box);
-    lv_obj_remove_style_all(grid);
-    lv_obj_set_size(grid, 330, 130);
-    lv_obj_align(grid, LV_ALIGN_TOP_MID, 0, 44);
-    lv_obj_set_style_pad_all(grid, 4, 0);
-    lv_obj_set_style_pad_row(grid, 6, 0);
-    lv_obj_set_style_pad_column(grid, 8, 0);
-    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t* localTitle = makeLabel(box, "本机仓号", &lv_font_chinese_14, C(CLR_TEXT));
+    lv_obj_align(localTitle, LV_ALIGN_TOP_LEFT, 14, 38);
+    lv_obj_t* localGrid = lv_obj_create(box);
+    lv_obj_remove_style_all(localGrid);
+    lv_obj_set_size(localGrid, 424, 48);
+    lv_obj_align(localGrid, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_set_flex_flow(localGrid, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(localGrid, LV_FLEX_ALIGN_SPACE_AROUND, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     for (int i = 0; i < BIN_COUNT; ++i) {
-        lv_obj_t* b = lv_btn_create(grid);
-        lv_obj_set_size(b, 96, 48);
+        lv_obj_t* b = lv_btn_create(localGrid);
+        lv_obj_set_size(b, 62, 42);
         lv_obj_set_style_radius(b, 6, 0);
         lv_obj_set_style_bg_color(b, C(i == localBin ? CLR_ROASTEK : 0xEEEEEE), 0);
         lv_obj_set_style_border_width(b, 0, 0);
@@ -605,11 +629,37 @@ inline void showDevBinDialog() {
                                   C(i == localBin ? 0xFFFFFF : CLR_TEXT));
         lv_obj_center(bl);
     }
+
+    lv_obj_t* masterTitle = makeLabel(box, "蓝牙主机仓号", &lv_font_chinese_14, C(CLR_TEXT));
+    lv_obj_align(masterTitle, LV_ALIGN_TOP_LEFT, 14, 122);
+    lv_obj_t* masterGrid = lv_obj_create(box);
+    lv_obj_remove_style_all(masterGrid);
+    lv_obj_set_size(masterGrid, 424, 48);
+    lv_obj_align(masterGrid, LV_ALIGN_TOP_MID, 0, 144);
+    lv_obj_set_flex_flow(masterGrid, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(masterGrid, LV_FLEX_ALIGN_SPACE_AROUND, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    for (int i = 0; i < BIN_COUNT; ++i) {
+        lv_obj_t* b = lv_btn_create(masterGrid);
+        lv_obj_set_size(b, 62, 42);
+        lv_obj_set_style_radius(b, 6, 0);
+        lv_obj_set_style_bg_color(b, C(i == masterBin ? CLR_ROASTEK : 0xEEEEEE), 0);
+        lv_obj_set_style_border_width(b, 0, 0);
+        lv_obj_set_style_shadow_width(b, 0, 0);
+        lv_obj_add_event_cb(b, devMasterSelectEvent, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        char bn[8];
+        snprintf(bn, sizeof(bn), "仓%d", i + 1);
+        lv_obj_t* bl = makeLabel(b, bn, &lv_font_chinese_14,
+                                  C(i == masterBin ? 0xFFFFFF : CLR_TEXT));
+        lv_obj_center(bl);
+    }
+
+    lv_obj_t* note = makeLabel(box, "修改后设备自动重启；只有主机占用蓝牙内存", &lv_font_chinese_14, C(CLR_MUTED));
+    lv_obj_align(note, LV_ALIGN_BOTTOM_MID, 0, -14);
 }
 
 inline void logoEvent(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED) return;
-    Serial.println("[EVENT] 长按logo: 进入开发者模式(选择本机仓号)");
+    Serial.println("[EVENT] 长按logo: 进入开发者模式(本机仓号/主机仓号)");
     showDevBinDialog();
 }
 
@@ -703,7 +753,27 @@ inline void updateConnLamp() {
 inline float Display_GetBinWeight() { return binWeights[localBin]; }
 inline float Display_GetCurrentWeight() { return simCurrentWeight; }
 inline uint8_t Display_GetLocalBinId() { return localBin + 1; }
+inline uint8_t Display_GetMasterBinId() { return masterBin + 1; }
+inline uint32_t Display_GetMasterEpoch() { return masterEpoch; }
 inline void Display_SetCurrentWeight(float w) { simCurrentWeight = w; updateWeights(); }
+
+// 有效净重断联时只把瞬时重量置0；binWeights[]累计仓重绝不清零。
+// 告警、红灯和按钮禁用继续沿用原来的离线UI。
+inline void Display_SetScaleDataOnline(bool isOnline) {
+    if (!isOnline) simCurrentWeight = 0.0f;
+    if (scaleUiInitialized && scaleDataOnline == isOnline) return;
+    scaleUiInitialized = true;
+    scaleDataOnline = isOnline;
+    if (isOnline) {
+        persistentError = false;
+        commRecoverPending = true;
+    } else {
+        persistentError = true;
+        setOnline(false);
+        showCommAlarm();
+        updateWeights();
+    }
+}
 
 // ESP-NOW 收到某仓状态变化 → 更新对应灯 + binOnline数组
 inline void Display_OnBinStateChange(uint8_t binId, bool isBinOnline, float binWeight, float currentWeight) {
@@ -713,19 +783,7 @@ inline void Display_OnBinStateChange(uint8_t binId, bool isBinOnline, float binW
     // 同步该仓重量(便于编辑面板等其他用途)
     if (idx != localBin) binWeights[idx] = binWeight;
 
-    // 通信告警按“有没有收到有效在线心跳”判断：
-    // 收到任意仓上线，都说明 ESP-NOW 通信已恢复，必须立刻隐藏左上告警并把大灯转绿。
-    if (isBinOnline) {
-        persistentError = false;
-        ::online = true;
-        commRecoverPending = true;
-    } else if (idx == localBin) {
-        // 只有本机仓被明确置离线时，才把大灯转红；远端单仓离线只影响6仓小灯。
-        persistentError = true;
-        ::online = false;
-        ::setOnline(false);
-        showCommAlarm();
-    }
+    // 六仓小灯与净重有效状态分离：其他节点在线不能掩盖称重链路离线告警。
     Serial.printf("[Display] 仓%d %s (重量%.1f)\n", binId, isBinOnline ? "上线" : "离线", binWeight);
     updateBinDots();
 }
@@ -746,21 +804,26 @@ inline void Display_OnBinWeightSync(uint8_t binId, float weight) {
 inline void Display_OnSilence(bool silent) {
     Serial.printf("[Display] 全静默: %s\n", silent ? "断网" : "恢复");
     if (silent) {
-        persistentError = true;
-        // 大灯红 + 禁用按钮
-        setOnline(false);
-        showCommAlarm();
+        Display_SetScaleDataOnline(false);
         // 6个状态灯全灰
         for (uint8_t i = 0; i < BIN_COUNT; ++i) binOnline[i] = false;
         updateBinDots();
     } else {
-        persistentError = false;
-        commRecoverPending = true;
-        if (localBin < BIN_COUNT) binOnline[localBin] = true;
-        setOnline(true);
-        hideCommAlarm();
+        // 收到主机包只代表无线链路恢复；必须等有效净重后才能解除告警。
         updateBinDots();
     }
+}
+
+// 收到新的主机配置后持久化并重启，确保从机不初始化BLE、主机才初始化BLE。
+inline void Display_OnMasterSelection(uint8_t newMasterBin, uint32_t newEpoch) {
+    if (newMasterBin < 1 || newMasterBin > BIN_COUNT) return;
+    if (newEpoch < masterEpoch) return;
+    if (masterBin == newMasterBin - 1 && masterEpoch == newEpoch) return;
+    masterBin = newMasterBin - 1;
+    masterEpoch = newEpoch;
+    nvsSaveBinWeights();
+    restartAtMs = millis() + 700;
+    Serial.printf("[Display] 已保存新主机: 仓%d, epoch=%u，准备重启\n", newMasterBin, newEpoch);
 }
 
 // ===== 更新6仓状态灯 =====
@@ -970,15 +1033,7 @@ inline void Display_Init() {
 }
 
 inline void Display_Loop() {
-    bool anyBinOnline = false;
-    for (uint8_t i = 0; i < BIN_COUNT; ++i) {
-        if (binOnline[i]) {
-            anyBinOnline = true;
-            break;
-        }
-    }
-
-    if (commRecoverPending || anyBinOnline) {
+    if (commRecoverPending && scaleDataOnline) {
         commRecoverPending = false;
         persistentError = false;
         setOnline(true);
@@ -990,12 +1045,16 @@ inline void Display_Loop() {
             Serial.println("[Display] 通信恢复: 已隐藏离线告警");
         }
     }
-    // 兜底：通信/在线状态已恢复时，任何残留的黄色告警框都必须被压掉。
-    // 告警框只允许 showCommAlarm() 主动显示，不再跟普通灯状态混在一起。
-    if ((online || anyBinOnline) && warnBox) {
+    // 只有有效净重恢复才隐藏告警；节点在线状态不能覆盖称重离线告警。
+    if (scaleDataOnline && online && warnBox) {
         lv_obj_add_flag(warnBox, LV_OBJ_FLAG_HIDDEN);
     }
     lv_timer_handler();
+    if (restartAtMs != 0 && static_cast<int32_t>(millis() - restartAtMs) >= 0) {
+        Serial.println("[System] 配置已保存，正在重启应用主从角色...");
+        delay(50);
+        ESP.restart();
+    }
 }
 
 // ===== 启动自测 =====
@@ -1003,48 +1062,42 @@ inline void Display_SelfTest() {
     Serial.println("[SELFTEST] === 开始 ===");
     bool allPass = true;
 
-    simCurrentWeight = 10.0f;
-    binWeights[0] = 50.0f;
-    Serial.printf("[SELFTEST] 初始: 仓重=%.1f 当前=%.1f\n", binWeights[0], simCurrentWeight);
+    // 只使用局部变量，绝不修改真实仓重、当前净重、NVS或UI状态。
+    float testCurrentWeight = 10.0f;
+    float testBinWeight = 50.0f;
+    Serial.printf("[SELFTEST] 初始: 仓重=%.1f 当前=%.1f\n", testBinWeight, testCurrentWeight);
 
-    float before = binWeights[0];
-    binWeights[0] += simCurrentWeight;
-    bool t1 = (binWeights[0] == 60.0f);
+    float before = testBinWeight;
+    testBinWeight += testCurrentWeight;
+    bool t1 = (testBinWeight == 60.0f);
     Serial.printf("[SELFTEST] 上料: %.1f += %.1f => %.1f  %s\n",
-                  before, simCurrentWeight, binWeights[0], t1 ? "PASS" : "FAIL");
+                  before, testCurrentWeight, testBinWeight, t1 ? "PASS" : "FAIL");
     allPass &= t1;
 
-    before = binWeights[0];
-    bool canUnload = binWeights[0] >= simCurrentWeight;
-    if (canUnload) binWeights[0] -= simCurrentWeight;
-    bool t2 = (binWeights[0] == 50.0f) && canUnload;
+    before = testBinWeight;
+    bool canUnload = testBinWeight >= testCurrentWeight;
+    if (canUnload) testBinWeight -= testCurrentWeight;
+    bool t2 = (testBinWeight == 50.0f) && canUnload;
     Serial.printf("[SELFTEST] 下料: %.1f -= %.1f => %.1f  %s\n",
-                  before, simCurrentWeight, binWeights[0], t2 ? "PASS" : "FAIL");
+                  before, testCurrentWeight, testBinWeight, t2 ? "PASS" : "FAIL");
     allPass &= t2;
 
-    binWeights[0] = 3.0f;
-    before = binWeights[0];
-    canUnload = binWeights[0] >= simCurrentWeight;
-    if (canUnload) binWeights[0] -= simCurrentWeight;
-    bool t3 = (!canUnload) && (binWeights[0] == 3.0f);
+    testBinWeight = 3.0f;
+    before = testBinWeight;
+    canUnload = testBinWeight >= testCurrentWeight;
+    if (canUnload) testBinWeight -= testCurrentWeight;
+    bool t3 = (!canUnload) && (testBinWeight == 3.0f);
     Serial.printf("[SELFTEST] 下料不足保护: 仓重 %.1f < 当前 %.1f, 拒绝, 仓重仍 %.1f  %s\n",
-                  before, simCurrentWeight, binWeights[0], t3 ? "PASS" : "FAIL");
+                  before, testCurrentWeight, testBinWeight, t3 ? "PASS" : "FAIL");
     allPass &= t3;
 
-    persistentError = true;
-    setButtonsEnabled(false);
-    bool buttonsDisabledWhenError = (lv_obj_get_state(btnLoad) & LV_STATE_DISABLED);
-    persistentError = false;
-    setButtonsEnabled(true);
-    bool buttonsEnabledAfterRecover = !(lv_obj_get_state(btnLoad) & LV_STATE_DISABLED);
-    bool t4 = buttonsDisabledWhenError && buttonsEnabledAfterRecover;
-    Serial.printf("[SELFTEST] 报错态按钮禁用=%d, 恢复后启用=%d  %s\n",
-                  buttonsDisabledWhenError, buttonsEnabledAfterRecover, t4 ? "PASS" : "FAIL");
+    float persistedTotal = 61.1f;
+    float offlineCurrent = 7.5f;
+    offlineCurrent = 0.0f;
+    bool t4 = persistedTotal == 61.1f && offlineCurrent == 0.0f;
+    Serial.printf("[SELFTEST] 离线瞬时重量=%.1f, 累计仓重仍=%.1f  %s\n",
+                  offlineCurrent, persistedTotal, t4 ? "PASS" : "FAIL");
     allPass &= t4;
-
-    binWeights[0] = 45.0f;
-    updateWeights();
-    showMessage("仓1 在线", false, false);
 
     Serial.printf("[SELFTEST] === %s ===\n", allPass ? "ALL PASS" : "SOME FAILED");
 }

@@ -7,6 +7,8 @@
 
 static uint32_t lastLvTick = 0;
 static bool selfTestDone = false;
+static bool bleRoleStarted = false;
+static uint32_t roleGraceStartedMs = 0;
 
 // ESP-NOW 收到某仓状态变化 → 通知Display更新对应灯
 void onBinStateChange(uint8_t binId, bool online, float binWeight, float currentWeight) {
@@ -34,24 +36,26 @@ void setup() {
     // Display_Init() 已从 NVS 读出本机仓号；ESP-NOW 必须使用同一个仓号，
     // 否则会出现 UI 显示仓5、网络仍广播仓1 的错位。
     const uint8_t localBinId = Display_GetLocalBinId();
-    EspnowMesh_SetMyBin(localBinId);
-    BleScale_SetMyBinId(localBinId);   // 让BLE任务知道本机仓号, 决定是否主动连模块
-
-    // 旧 Bluedroid 栈必须先于 WiFi/ESP-NOW 初始化，之后才能稳定执行 GATT connect。
-    // BLE任务有错峰延时，ESP-NOW会在它首次扫描前完成初始化。
-    BleScale_Init();
+    uint8_t networkBinId = localBinId;
+#ifdef A33E_TEST_FORCE_LOCAL_BIN
+    networkBinId = A33E_TEST_FORCE_LOCAL_BIN;
+    Serial.printf("[TEST] 临时网络仓号覆盖: 仓%d (不写入NVS)\n", networkBinId);
+#endif
+    EspnowMesh_SetMyBin(networkBinId);
+    EspnowMesh_SetMasterSelection(Display_GetMasterBinId(), Display_GetMasterEpoch());
+    BleScale_SetMyBinId(networkBinId);
+    BleScale_SetEnabled(false);  // 先留3秒接收最新主机配置，只有主机才初始化NimBLE
 
     EspnowMesh_SetGateway(DEFAULT_GATEWAY_FLAG);
     EspnowMesh_SetStateCallback(onBinStateChange);
     EspnowMesh_SetWeightSyncCallback(Display_OnBinWeightSync);
     EspnowMesh_SetSilenceCallback(Display_OnSilence);
+    EspnowMesh_SetMasterSelectionCallback(Display_OnMasterSelection);
     if (!EspnowMesh_Init()) {
         Serial.println("[A33E] ESP-NOW初始化失败, 仅UI运行");
-    } else {
-        // 上电后立即广播上线，不等待2秒心跳周期，避免其他仓不知道本机已恢复。
-        EspnowMesh_AnnounceOnline(Display_GetBinWeight(), Display_GetCurrentWeight(), 5, 40);
     }
 
+    roleGraceStartedMs = millis();
     lastLvTick = millis();
 }
 
@@ -69,16 +73,36 @@ void loop() {
         selfTestDone = true;
     }
 
-    // 只显示真实净重。无本地/远程有效读数时安全回退为0，不再广播模拟重量。
+    // 上电先监听3秒，避免带旧配置的设备抢先初始化BLE形成双主机。
+    if (!bleRoleStarted && now - roleGraceStartedMs >= 3000) {
+        bleRoleStarted = true;
+        bool isMaster = EspnowMesh_IsMaster();
+        BleScale_SetEnabled(isMaster);
+        if (isMaster) {
+            Serial.printf("[ROLE] 本机仓%d是主机，启动NimBLE称重任务\n", Display_GetLocalBinId());
+            BleScale_Init();
+        } else {
+            Serial.printf("[ROLE] 本机仓%d是从机，主机为仓%d，不初始化BLE\n",
+                          Display_GetLocalBinId(), Display_GetMasterBinId());
+        }
+    }
+
+    // 只显示真实净重。本机或主机数据失效时显示0，但绝不修改累计仓重。
     float currentWeight = BleScale_Loop(0.0f);
+    bool scaleDataValid = EspnowMesh_IsMaster()
+        ? BleScale_IsConnected()
+        : EspnowMesh_RemoteBleActive();
+    if (!scaleDataValid) currentWeight = 0.0f;
 
     // 更新 Display 当前称重
     Display_SetCurrentWeight(currentWeight);
+    Display_SetScaleDataOnline(scaleDataValid);
 
     // 显示循环
     Display_Loop();
 
-    // ESP-NOW 组网循环: 广播心跳 + 离线检测
+    // 主机每2秒广播净重；从机错峰ACK；6秒超时进入原离线告警UI。
+    EspnowMesh_SetLocalBleConnected(EspnowMesh_IsMaster() && scaleDataValid);
     EspnowMesh_Loop(Display_GetBinWeight(), Display_GetCurrentWeight());
 
     delay(2);

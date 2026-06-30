@@ -4,435 +4,466 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
-#include <cstring>
 #include "Config.h"
 
-// ============================================================
-//  ESP-NOW 组网 (6台屏幕互相广播心跳, 更新在线状态)
-//  不依赖WiFi路由器, 同信道(ch6)直接设备对设备
-// ============================================================
+// 一主多从通信：
+// - 只有被选中的主机连接 BLE，并每 2 秒广播一次净重。
+// - 从机收到重量包后按仓号错峰回复 ACK。
+// - 主机根据 6 秒内的 ACK 生成六仓在线位图，再随重量包广播给所有从机。
+// - 重量包本身就是主机心跳，不再维护另一套心跳协议。
 
-// 广播MAC: 发给所有同信道设备
-static constexpr uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static constexpr uint8_t ESPNOW_CHANNEL = 6;
-static constexpr uint32_t HEARTBEAT_INTERVAL_MS = 2000;   // 每2秒广播一次心跳
-static constexpr uint32_t OFFLINE_TIMEOUT_MS = 10000;     // 10秒没收到某仓=该仓离线
-static constexpr uint32_t SILENCE_TIMEOUT_MS = 8000;      // 8秒没收到任何广播=全静默(断网)
-static constexpr uint32_t REMOTE_BLE_LEASE_MS = 6000;     // 远程有效称重租约，超过即允许其他设备接管
+static constexpr uint8_t ESPNOW_BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static constexpr uint32_t WEIGHT_BROADCAST_INTERVAL_MS = 2000;
+static constexpr uint32_t DEVICE_OFFLINE_TIMEOUT_MS = 6000;
+static constexpr uint32_t MASTER_OFFLINE_TIMEOUT_MS = 6000;
 
-// 心跳包结构 (固定24字节, 便于广播)
-#pragma pack(push, 1)
-struct HeartbeatPacket {
-    uint32_t magic;          // 魔数 0xA33E0001, 用于识别本协议包
-    uint8_t  binId;          // 仓号 1-6 (发送方的仓号)
-    uint8_t  role;           // 角色: 0=普通节点, 1=网关
-    uint8_t  bleConnected;   // 发送方是否已连上BLE称重模块 (1=已连,读到的重量在currentWeight)
-    uint8_t  online;         // 发送方自报在线状态 (1=在线)
-    float    binWeight;      // 发送方本机仓重
-    float    currentWeight;  // 发送方当前称重 (若bleConnected=1, 这是真实A33E毛重)
-    uint32_t seq;            // 序列号(递增)
-    uint8_t  mac[6];         // 发送方MAC (冗余, 便于调试)
-};
-#pragma pack(pop)
-
-// 仓重同步包 (编辑面板修改任意仓重后广播, 12字节)
-#pragma pack(push, 1)
-struct BinWeightSyncPacket {
-    uint32_t magic;          // 魔数 0xA33E0002
-    uint8_t  binId;          // 被修改的仓号 1-6
-    float    weight;         // 新仓重
-};
-#pragma pack(pop)
-
-static constexpr uint32_t HEARTBEAT_MAGIC = 0xA33E0001;
+static constexpr uint32_t MASTER_WEIGHT_MAGIC = 0xA33E1001;
+static constexpr uint32_t FOLLOWER_ACK_MAGIC = 0xA33E1002;
 static constexpr uint32_t BIN_WEIGHT_SYNC_MAGIC = 0xA33E0002;
+static constexpr uint32_t MASTER_SELECT_MAGIC = 0xA33E1003;
+static constexpr uint8_t ESPNOW_PROTOCOL_VERSION = 2;
 
-// 每仓的在线状态(收到的心跳信息)
+#pragma pack(push, 1)
+struct MasterWeightPacket {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t masterBin;
+    uint8_t netValid;
+    uint8_t onlineMask;
+    float netWeight;
+    uint32_t seq;
+    uint32_t masterEpoch;
+};
+
+struct FollowerAckPacket {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t binId;
+    uint8_t masterBin;
+    uint8_t reserved;
+    uint32_t weightSeq;
+    uint32_t masterEpoch;
+};
+
+struct BinWeightSyncPacket {
+    uint32_t magic;
+    uint8_t binId;
+    float weight;
+};
+
+struct MasterSelectPacket {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t masterBin;
+    uint8_t sourceBin;
+    uint8_t reserved;
+    uint32_t masterEpoch;
+};
+#pragma pack(pop)
+
 struct BinState {
-    bool     online;         // 是否在线
-    uint32_t lastHeardMs;    // 最后一次收到心跳的时间
-    float    binWeight;      // 该仓的仓重
-    float    currentWeight;  // 该仓的当前称重
-    uint8_t  bleConnected;   // 该仓是否已连上BLE称重模块
-    uint8_t  mac[6];         // 该仓的MAC
+    bool online;
+    uint32_t lastHeardMs;
+    float binWeight;
+    float currentWeight;
 };
 
 inline BinState binStates[BIN_COUNT] = {};
-inline uint32_t hbSeq = 0;
-inline uint32_t lastHeartbeatSentMs = 0;
-inline uint32_t lastAnyRecvMs = 0;   // 最后一次收到任何广播的时间
-inline bool     isSilent = false;    // 当前是否处于全静默状态
-inline uint8_t  myMac[6] = {0};
+inline uint8_t myBinId = DEFAULT_LOCAL_ID;
+inline uint8_t selectedMasterBin = 3;
+inline uint32_t selectedMasterEpoch = 1;
+inline uint8_t myMac[6] = {};
+inline bool meshInitialized = false;
 
-// 本机信息 (由 main 设置)
-inline uint8_t myBinId = 1;        // 本机仓号 1-6
-inline bool   myIsGateway = true;  // 本机是否网关
+inline volatile bool localNetValid = false;
+inline volatile float localNetWeight = 0.0f;
+inline volatile bool remoteNetValid = false;
+inline volatile float remoteNetWeight = 0.0f;
+inline volatile uint32_t lastMasterFrameMs = 0;
+inline volatile uint32_t lastMasterSeq = 0;
+inline volatile uint8_t lastOnlineMask = 0;
 
-// ===== 回调: 供 Display 调用, 收到某仓心跳/某仓离线时更新UI =====
+inline uint32_t lastWeightBroadcastMs = 0;
+inline uint32_t weightSeq = 0;
+inline uint32_t meshStartedMs = 0;
+inline uint32_t followerLastAckMs[BIN_COUNT] = {};
+inline bool silenceState = false;
+
+inline volatile bool ackPending = false;
+inline volatile uint32_t ackDueMs = 0;
+inline volatile uint32_t ackWeightSeq = 0;
+inline volatile uint8_t ackRepeatsRemaining = 0;
+inline volatile bool masterSelectionPending = false;
+inline volatile uint8_t pendingMasterBin = 0;
+inline volatile uint32_t pendingMasterEpoch = 0;
+inline volatile bool onlineMaskPending = false;
+inline volatile uint8_t pendingOnlineMask = 0;
+inline volatile float pendingOnlineWeight = 0.0f;
+inline volatile bool binWeightSyncPending = false;
+inline volatile uint8_t pendingSyncBin = 0;
+inline volatile float pendingSyncWeight = 0.0f;
+inline portMUX_TYPE meshMux = portMUX_INITIALIZER_UNLOCKED;
+
 typedef void (*OnBinStateChangeCb)(uint8_t binId, bool online, float binWeight, float currentWeight);
-inline OnBinStateChangeCb gOnBinStateCb = nullptr;
-
-// ===== 回调: 收到仓重同步包 → 更新本地仓重 =====
 typedef void (*OnBinWeightSyncCb)(uint8_t binId, float weight);
-inline OnBinWeightSyncCb gOnBinWeightSyncCb = nullptr;
-
-// ===== 回调: 全静默状态变化 (断网/恢复) =====
 typedef void (*OnSilenceCb)(bool silent);
-inline OnSilenceCb gOnSilenceCb = nullptr;
-
-// ===== 回调: 远程BLE称重状态变化 =====
-// 当任一远端屏幕连上/断开BLE称重模块时通知本机, 本机据此决定是否启动自己的BLE
-// remoteBleConnected: 是否有其他屏幕已连上模块
-// weight: 若已连上, 这是它读到的实时重量 (其他屏共享这个重量)
 typedef void (*OnRemoteBleCb)(bool remoteBleConnected, float weight);
+typedef void (*OnMasterSelectionCb)(uint8_t masterBin, uint32_t masterEpoch);
+
+inline OnBinStateChangeCb gOnBinStateCb = nullptr;
+inline OnBinWeightSyncCb gOnBinWeightSyncCb = nullptr;
+inline OnSilenceCb gOnSilenceCb = nullptr;
 inline OnRemoteBleCb gOnRemoteBleCb = nullptr;
+inline OnMasterSelectionCb gOnMasterSelectionCb = nullptr;
 
-// 远程BLE状态追踪: 是否有其他屏连上了BLE模块, 以及它读到的重量
-inline volatile bool     gRemoteBleConnected = false;   // 有没有别台持有有效称重租约
-inline volatile float    gRemoteBleWeight = 0.0f;       // 别台读到的净重
-inline volatile uint32_t gRemoteBleLastMs = 0;          // 最后一次收到 bleConnected=1 心跳的时间
-inline volatile uint8_t  gRemoteBleBin = 0;             // 是哪台持有租约 (仓号)
-inline uint8_t gRemoteBleMac[6] = {0};                  // 租约持有者MAC，用于精确释放和竞态裁决
-
-inline void EspnowMesh_SetStateCallback(OnBinStateChangeCb cb) {
-    gOnBinStateCb = cb;
+inline bool EspnowMesh_IsMaster() {
+    return myBinId == selectedMasterBin;
 }
 
-inline void EspnowMesh_SetWeightSyncCallback(OnBinWeightSyncCb cb) {
-    gOnBinWeightSyncCb = cb;
-}
-
-inline void EspnowMesh_SetSilenceCallback(OnSilenceCb cb) {
-    gOnSilenceCb = cb;
-}
-
-inline void EspnowMesh_SetRemoteBleCallback(OnRemoteBleCb cb) {
-    gOnRemoteBleCb = cb;
-}
-
-// 供 BleScaleClient 查询: 是否已有其他屏连上BLE模块 (本机就不该再去连)
-inline bool EspnowMesh_RemoteBleActive() {
-    return gRemoteBleConnected && (millis() - gRemoteBleLastMs < REMOTE_BLE_LEASE_MS);
-}
-
-// 供 BleScaleClient 查询: 其他屏读到的共享重量
-inline float EspnowMesh_RemoteBleWeight() {
-    return gRemoteBleWeight;
-}
-
-// 所有设备都可尝试连接。只有两台几乎同时拿到有效数据时，才用仓号+MAC裁决：
-// 仓号小者优先；仓号相同则MAC字典序小者优先，保证双方得出同一个赢家。
-inline int EspnowMesh_CompareBleOwner(uint8_t binA, const uint8_t macA[6],
-                                      uint8_t binB, const uint8_t macB[6]) {
-    if (binA != binB) return (binA < binB) ? -1 : 1;
-    return memcmp(macA, macB, 6);
-}
-
-inline bool EspnowMesh_RemoteBleWinsTie() {
-    if (!EspnowMesh_RemoteBleActive()) return false;
-    return EspnowMesh_CompareBleOwner(gRemoteBleBin, gRemoteBleMac, myBinId, myMac) < 0;
-}
+inline void EspnowMesh_SetStateCallback(OnBinStateChangeCb cb) { gOnBinStateCb = cb; }
+inline void EspnowMesh_SetWeightSyncCallback(OnBinWeightSyncCb cb) { gOnBinWeightSyncCb = cb; }
+inline void EspnowMesh_SetSilenceCallback(OnSilenceCb cb) { gOnSilenceCb = cb; }
+inline void EspnowMesh_SetRemoteBleCallback(OnRemoteBleCb cb) { gOnRemoteBleCb = cb; }
+inline void EspnowMesh_SetMasterSelectionCallback(OnMasterSelectionCb cb) { gOnMasterSelectionCb = cb; }
 
 inline void EspnowMesh_SetMyBin(uint8_t binId) {
-    if (binId < 1 || binId > BIN_COUNT) binId = 1;
-    myBinId = binId;
+    if (binId >= 1 && binId <= BIN_COUNT) myBinId = binId;
 }
 
-inline void EspnowMesh_SetGateway(bool isGw) {
-    myIsGateway = isGw;
+inline void EspnowMesh_SetGateway(bool) {}
+
+inline void EspnowMesh_SetMasterSelection(uint8_t masterBin, uint32_t masterEpoch) {
+    if (masterBin < 1 || masterBin > BIN_COUNT) masterBin = 3;
+    selectedMasterBin = masterBin;
+    selectedMasterEpoch = masterEpoch == 0 ? 1 : masterEpoch;
 }
 
-// 前置声明 (EspnowMesh_OnBinChanged 需要调用)
-inline void EspnowMesh_BroadcastHeartbeat(float binWeight, float currentWeight);
-inline void EspnowMesh_AnnounceOnline(float binWeight, float currentWeight, uint8_t repeats = 5, uint16_t gapMs = 40);
+inline uint8_t EspnowMesh_GetMasterBin() { return selectedMasterBin; }
+inline uint32_t EspnowMesh_GetMasterEpoch() { return selectedMasterEpoch; }
 
-inline void EspnowMesh_MarkAnyRecv() {
-    lastAnyRecvMs = millis();
-    if (isSilent) {
-        isSilent = false;
-        Serial.println("[ESPNOW] 全静默状态: 恢复");
-        if (gOnSilenceCb) gOnSilenceCb(false);
-    }
+inline bool EspnowMesh_RemoteBleActive() {
+    uint32_t last = lastMasterFrameMs;
+    return !EspnowMesh_IsMaster() && remoteNetValid && last > 0 &&
+           millis() - last < MASTER_OFFLINE_TIMEOUT_MS;
 }
 
-// ===== 本机换仓: 旧仓下线, 新仓上线(通知Display更新灯) =====
-// newBinWeight: 新仓的重量, 换仓后连发3次心跳确保可靠送达
-inline void EspnowMesh_OnBinChanged(uint8_t oldBinId, uint8_t newBinId, float newBinWeight, float currentWeight) {
-    // 旧仓标记离线
-    if (oldBinId >= 1 && oldBinId <= BIN_COUNT && oldBinId != newBinId) {
-        binStates[oldBinId - 1].online = false;
-        if (gOnBinStateCb) gOnBinStateCb(oldBinId, false, 0, 0);
-    }
-    // 新仓标记在线
-    myBinId = newBinId;
-    if (newBinId >= 1 && newBinId <= BIN_COUNT) {
-        uint8_t idx = newBinId - 1;
-        binStates[idx].online = true;
-        binStates[idx].lastHeardMs = millis();
-        memcpy(binStates[idx].mac, myMac, 6);
-        if (gOnBinStateCb) gOnBinStateCb(newBinId, true, 0, 0);
-    }
-    Serial.printf("[ESPNOW] 本机换仓: %d→%d\n", oldBinId, newBinId);
-    // 连发心跳确保对方可靠收到换仓通知
-    EspnowMesh_AnnounceOnline(newBinWeight, currentWeight, 5, 40);
+inline float EspnowMesh_RemoteBleWeight() {
+    return EspnowMesh_RemoteBleActive() ? remoteNetWeight : 0.0f;
 }
 
-// 本机BLE连接状态 (由 BleScaleClient 通过本函数更新)
-inline volatile uint8_t gLocalBleConnected = 0;  // 0=无有效数据, 1=持有有效净重租约
-inline volatile bool gForceHeartbeatPending = false;
+inline bool EspnowMesh_RemoteBleWinsTie() { return !EspnowMesh_IsMaster(); }
+
 inline void EspnowMesh_SetLocalBleConnected(bool connected) {
-    uint8_t next = connected ? 1 : 0;
-    if (gLocalBleConnected != next) {
-        gLocalBleConnected = next;
-        gForceHeartbeatPending = true;  // 断联/接管不等待下一个2秒周期
-    }
+    localNetValid = connected;
+    if (!connected) localNetWeight = 0.0f;
 }
 
-// ===== 广播一个心跳 =====
+inline uint8_t EspnowMesh_BuildOnlineMask(uint32_t now) {
+    uint8_t mask = 0;
+    if (selectedMasterBin >= 1 && selectedMasterBin <= BIN_COUNT)
+        mask |= static_cast<uint8_t>(1U << (selectedMasterBin - 1));
+    for (uint8_t i = 0; i < BIN_COUNT; ++i) {
+        uint8_t binId = i + 1;
+        if (binId == selectedMasterBin) continue;
+        if (followerLastAckMs[i] > 0 && now - followerLastAckMs[i] < DEVICE_OFFLINE_TIMEOUT_MS)
+            mask |= static_cast<uint8_t>(1U << i);
+    }
+    return mask;
+}
+
+inline void EspnowMesh_ApplyOnlineMask(uint8_t mask, float currentWeight) {
+    for (uint8_t i = 0; i < BIN_COUNT; ++i) {
+        bool next = (mask & (1U << i)) != 0;
+        bool changed = binStates[i].online != next;
+        binStates[i].online = next;
+        if (next) binStates[i].lastHeardMs = millis();
+        binStates[i].currentWeight = currentWeight;
+        if (changed && gOnBinStateCb)
+            gOnBinStateCb(i + 1, next, binStates[i].binWeight, currentWeight);
+    }
+    lastOnlineMask = mask;
+}
+
 inline void EspnowMesh_BroadcastHeartbeat(float binWeight, float currentWeight) {
-    HeartbeatPacket pkt;
-    pkt.magic = HEARTBEAT_MAGIC;
-    pkt.binId = myBinId;
-    pkt.role = myIsGateway ? 1 : 0;
-    pkt.bleConnected = gLocalBleConnected;  // 本机是否已连上BLE模块
-    pkt.online = 1;
-    pkt.binWeight = binWeight;
-    pkt.currentWeight = currentWeight;
-    pkt.seq = ++hbSeq;
-    memcpy(pkt.mac, myMac, 6);
-
-    esp_err_t result = esp_now_send(BROADCAST_MAC, (const uint8_t*)&pkt, sizeof(pkt));
-    if (result != ESP_OK) {
-        Serial.printf("[ESPNOW] 发送失败: %s\n", esp_err_to_name(result));
+    if (!meshInitialized || !EspnowMesh_IsMaster()) return;
+    uint32_t now = millis();
+    uint8_t mask = EspnowMesh_BuildOnlineMask(now);
+    MasterWeightPacket pkt{};
+    pkt.magic = MASTER_WEIGHT_MAGIC;
+    pkt.version = ESPNOW_PROTOCOL_VERSION;
+    pkt.masterBin = selectedMasterBin;
+    pkt.netValid = localNetValid ? 1 : 0;
+    pkt.onlineMask = mask;
+    pkt.netWeight = pkt.netValid ? currentWeight : 0.0f;
+    pkt.seq = ++weightSeq;
+    pkt.masterEpoch = selectedMasterEpoch;
+    esp_now_send(ESPNOW_BROADCAST_MAC, reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
+    binStates[myBinId - 1].binWeight = binWeight;
+    EspnowMesh_ApplyOnlineMask(mask, pkt.netWeight);
+    if (pkt.seq == 1 || pkt.seq % 5 == 0) {
+        Serial.printf("[ESPNOW] 主机仓%d广播: seq=%u 净重=%.3f valid=%u onlineMask=0x%02X\n",
+                      pkt.masterBin, pkt.seq, pkt.netWeight, pkt.netValid, pkt.onlineMask);
     }
 }
 
-inline void EspnowMesh_AnnounceOnline(float binWeight, float currentWeight, uint8_t repeats, uint16_t gapMs) {
+inline void EspnowMesh_AnnounceOnline(float binWeight, float currentWeight, uint8_t repeats = 3, uint16_t gapMs = 30) {
+    if (!EspnowMesh_IsMaster()) return;
     for (uint8_t i = 0; i < repeats; ++i) {
         EspnowMesh_BroadcastHeartbeat(binWeight, currentWeight);
-        if (gapMs > 0 && i + 1 < repeats) delay(gapMs);
+        if (i + 1 < repeats) delay(gapMs);
     }
-    lastHeartbeatSentMs = millis();
+    lastWeightBroadcastMs = millis();
 }
 
-// ===== 广播仓重同步 (编辑面板修改任意仓重后调用) =====
 inline void EspnowMesh_BroadcastBinWeightSync(uint8_t binId, float weight) {
-    BinWeightSyncPacket pkt;
-    pkt.magic = BIN_WEIGHT_SYNC_MAGIC;
-    pkt.binId = binId;
-    pkt.weight = weight;
-
-    esp_err_t result = esp_now_send(BROADCAST_MAC, (const uint8_t*)&pkt, sizeof(pkt));
-    if (result == ESP_OK) {
-        Serial.printf("[ESPNOW] 仓重同步广播: 仓%d → %.1f kg\n", binId, weight);
-    } else {
-        Serial.printf("[ESPNOW] 仓重同步发送失败: %s\n", esp_err_to_name(result));
-    }
+    if (!meshInitialized || binId < 1 || binId > BIN_COUNT) return;
+    BinWeightSyncPacket pkt{BIN_WEIGHT_SYNC_MAGIC, binId, weight};
+    esp_now_send(ESPNOW_BROADCAST_MAC, reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
+    Serial.printf("[ESPNOW] 仓重同步广播: 仓%d → %.1f kg\n", binId, weight);
 }
 
-// ===== ESP-NOW 接收回调 (Arduino-ESP32 2.x 旧签名) =====
-inline void onEspNowRecv(const uint8_t* mac_addr, const uint8_t* data, int len) {
-    // 仓重同步包 (12字节, magic=0xA33E0002)
-    if (len == (int)sizeof(BinWeightSyncPacket)) {
-        BinWeightSyncPacket sync;
-        memcpy(&sync, data, sizeof(sync));
-        if (sync.magic == BIN_WEIGHT_SYNC_MAGIC && sync.binId >= 1 && sync.binId <= BIN_COUNT) {
-            // 排除自己发的
-            uint8_t senderMac[6];
-            memcpy(senderMac, mac_addr, 6);
-            if (memcmp(senderMac, myMac, 6) == 0) return;
+inline void EspnowMesh_BroadcastMasterSelection(uint8_t masterBin, uint32_t masterEpoch) {
+    if (!meshInitialized || masterBin < 1 || masterBin > BIN_COUNT) return;
+    MasterSelectPacket pkt{};
+    pkt.magic = MASTER_SELECT_MAGIC;
+    pkt.version = ESPNOW_PROTOCOL_VERSION;
+    pkt.masterBin = masterBin;
+    pkt.sourceBin = myBinId;
+    pkt.masterEpoch = masterEpoch;
+    for (uint8_t i = 0; i < 5; ++i) {
+        esp_now_send(ESPNOW_BROADCAST_MAC, reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
+        delay(35);
+    }
+    portENTER_CRITICAL(&meshMux);
+    pendingMasterBin = masterBin;
+    pendingMasterEpoch = masterEpoch;
+    masterSelectionPending = true;
+    portEXIT_CRITICAL(&meshMux);
+}
 
-            EspnowMesh_MarkAnyRecv();  // 收到任何广播=网络通畅
-            Serial.printf("[ESPNOW] 收到仓重同步: 仓%d → %.1f kg\n", sync.binId, sync.weight);
-            if (gOnBinWeightSyncCb) gOnBinWeightSyncCb(sync.binId, sync.weight);
+inline void EspnowMesh_OnBinChanged(uint8_t oldBinId, uint8_t newBinId, float newBinWeight, float currentWeight) {
+    (void)oldBinId;
+    (void)currentWeight;
+    EspnowMesh_SetMyBin(newBinId);
+    if (newBinId >= 1 && newBinId <= BIN_COUNT) binStates[newBinId - 1].binWeight = newBinWeight;
+}
+
+inline void EspnowMesh_QueueMasterSelection(uint8_t masterBin, uint32_t masterEpoch) {
+    if (masterBin < 1 || masterBin > BIN_COUNT) return;
+    if (masterEpoch < selectedMasterEpoch) return;
+    if (masterEpoch == selectedMasterEpoch && masterBin == selectedMasterBin) return;
+    portENTER_CRITICAL(&meshMux);
+    pendingMasterBin = masterBin;
+    pendingMasterEpoch = masterEpoch;
+    masterSelectionPending = true;
+    portEXIT_CRITICAL(&meshMux);
+}
+
+inline void onEspNowRecv(const uint8_t* macAddr, const uint8_t* data, int len) {
+    if (!data || len < static_cast<int>(sizeof(uint32_t))) return;
+    if (memcmp(macAddr, myMac, 6) == 0) return;
+    uint32_t magic = 0;
+    memcpy(&magic, data, sizeof(magic));
+
+    if (magic == MASTER_WEIGHT_MAGIC && len == static_cast<int>(sizeof(MasterWeightPacket))) {
+        MasterWeightPacket pkt{};
+        memcpy(&pkt, data, sizeof(pkt));
+        if (pkt.version != ESPNOW_PROTOCOL_VERSION || pkt.masterBin < 1 || pkt.masterBin > BIN_COUNT) return;
+        if (pkt.masterEpoch < selectedMasterEpoch) return;
+        if (pkt.masterEpoch > selectedMasterEpoch || pkt.masterBin != selectedMasterBin) {
+            EspnowMesh_QueueMasterSelection(pkt.masterBin, pkt.masterEpoch);
+            return;
         }
+        if (EspnowMesh_IsMaster()) return;
+
+        lastMasterFrameMs = millis();
+        lastMasterSeq = pkt.seq;
+        remoteNetValid = pkt.netValid != 0;
+        remoteNetWeight = remoteNetValid ? pkt.netWeight : 0.0f;
+
+        // 本机刚收到主机数据，自己的灯可立即点亮；主机将在收到 ACK 后同步给其他设备。
+        uint8_t visibleMask = pkt.onlineMask | static_cast<uint8_t>(1U << (myBinId - 1));
+        portENTER_CRITICAL(&meshMux);
+        pendingOnlineMask = visibleMask;
+        pendingOnlineWeight = remoteNetWeight;
+        onlineMaskPending = true;
+        ackWeightSeq = pkt.seq;
+        ackDueMs = millis() + 25U + static_cast<uint32_t>(myBinId - 1U) * 35U;
+        ackRepeatsRemaining = 2;
+        ackPending = true;
+        portEXIT_CRITICAL(&meshMux);
         return;
     }
 
-    // 心跳包 (24字节, magic=0xA33E0001)
-    if (len != (int)sizeof(HeartbeatPacket)) return;
-    HeartbeatPacket pkt;
-    memcpy(&pkt, data, sizeof(pkt));
-    if (pkt.magic != HEARTBEAT_MAGIC) return;
-    if (pkt.binId < 1 || pkt.binId > BIN_COUNT) return;
-
-    // 排除自己(自己发的广播也会收到)
-    if (memcmp(pkt.mac, myMac, 6) == 0) return;
-
-    EspnowMesh_MarkAnyRecv();  // 收到任何广播=网络通畅
-    uint8_t idx = pkt.binId - 1;  // 0-5
-
-    // 每5秒打印一次心跳摘要(避免刷屏)
-    static uint32_t lastRecvLogMs = 0;
-    if (millis() - lastRecvLogMs > 5000) {
-        lastRecvLogMs = millis();
-        Serial.printf("[ESPNOW] 收: 仓%d MAC %02X:%02X:..seq=%u bw=%.1f cw=%.1f\n",
-                      pkt.binId, pkt.mac[0], pkt.mac[1], pkt.seq, pkt.binWeight, pkt.currentWeight);
+    if (magic == FOLLOWER_ACK_MAGIC && len == static_cast<int>(sizeof(FollowerAckPacket))) {
+        if (!EspnowMesh_IsMaster()) return;
+        FollowerAckPacket pkt{};
+        memcpy(&pkt, data, sizeof(pkt));
+        if (pkt.version != ESPNOW_PROTOCOL_VERSION || pkt.masterBin != selectedMasterBin ||
+            pkt.masterEpoch != selectedMasterEpoch || pkt.binId < 1 || pkt.binId > BIN_COUNT ||
+            pkt.binId == selectedMasterBin) return;
+        bool firstAck = followerLastAckMs[pkt.binId - 1] == 0;
+        followerLastAckMs[pkt.binId - 1] = millis();
+        if (firstAck) Serial.printf("[ESPNOW] 收到仓%d从机ACK\n", pkt.binId);
+        return;
     }
 
-    bool wasOnline = binStates[idx].online;
-    binStates[idx].online = true;
-    binStates[idx].lastHeardMs = millis();
-    binStates[idx].binWeight = pkt.binWeight;
-    binStates[idx].currentWeight = pkt.currentWeight;
-    binStates[idx].bleConnected = pkt.bleConnected;
-    memcpy(binStates[idx].mac, pkt.mac, 6);
-
-    // ---- BLE称重协调: bleConnected 表示“有近期有效净重”，不是仅GATT物理连接 ----
-    if (pkt.bleConnected) {
-        bool wasRemoteActive = EspnowMesh_RemoteBleActive();
-        bool sameOwner = gRemoteBleConnected && memcmp(pkt.mac, gRemoteBleMac, 6) == 0;
-        bool betterOwner = !wasRemoteActive || sameOwner ||
-            EspnowMesh_CompareBleOwner(pkt.binId, pkt.mac, gRemoteBleBin, gRemoteBleMac) < 0;
-        if (betterOwner) {
-            gRemoteBleConnected = true;
-            gRemoteBleLastMs = millis();
-            gRemoteBleWeight = pkt.currentWeight;
-            gRemoteBleBin = pkt.binId;
-            memcpy(gRemoteBleMac, pkt.mac, 6);
-        }
-        if (!wasRemoteActive && betterOwner) {
-            Serial.printf("[ESPNOW] 远程仓%d 已连上BLE称重 (重量=%.1f kg), 本机停止BLE\n",
-                          pkt.binId, pkt.currentWeight);
-            if (gOnRemoteBleCb) gOnRemoteBleCb(true, pkt.currentWeight);
-        }
-    } else if (gRemoteBleConnected && memcmp(pkt.mac, gRemoteBleMac, 6) == 0) {
-        // 只有当前租约持有者的断联心跳才释放，其他普通节点的0不能误清租约。
-        Serial.printf("[ESPNOW] 远程仓%d 主动释放BLE称重租约\n", pkt.binId);
-        gRemoteBleConnected = false;
-        gRemoteBleLastMs = 0;
-        gRemoteBleBin = 0;
-        memset(gRemoteBleMac, 0, sizeof(gRemoteBleMac));
-        if (gOnRemoteBleCb) gOnRemoteBleCb(false, 0.0f);
+    if (magic == BIN_WEIGHT_SYNC_MAGIC && len == static_cast<int>(sizeof(BinWeightSyncPacket))) {
+        BinWeightSyncPacket pkt{};
+        memcpy(&pkt, data, sizeof(pkt));
+        if (pkt.binId < 1 || pkt.binId > BIN_COUNT) return;
+        portENTER_CRITICAL(&meshMux);
+        pendingSyncBin = pkt.binId;
+        pendingSyncWeight = pkt.weight;
+        binWeightSyncPending = true;
+        portEXIT_CRITICAL(&meshMux);
+        return;
     }
 
-    // 首次上线打印日志
-    if (!wasOnline) {
-        Serial.printf("[ESPNOW] 仓%d 上线 (MAC %02X:%02X:%02X:%02X:%02X:%02X)\n",
-                      pkt.binId, pkt.mac[0], pkt.mac[1], pkt.mac[2],
-                      pkt.mac[3], pkt.mac[4], pkt.mac[5]);
+    if (magic == MASTER_SELECT_MAGIC && len == static_cast<int>(sizeof(MasterSelectPacket))) {
+        MasterSelectPacket pkt{};
+        memcpy(&pkt, data, sizeof(pkt));
+        if (pkt.version != ESPNOW_PROTOCOL_VERSION) return;
+        EspnowMesh_QueueMasterSelection(pkt.masterBin, pkt.masterEpoch);
     }
-    // 每次收到心跳都通知UI刷新灯 (解决换仓后灯延迟变绿问题)
-    if (gOnBinStateCb) gOnBinStateCb(pkt.binId, true, pkt.binWeight, pkt.currentWeight);
 }
 
-// ===== ESP-NOW 发送回调 =====
-inline void onEspNowSend(const uint8_t* mac_addr, esp_now_send_status_t status) {
-    // 静默, 仅调试时可打开
-    // Serial.printf("[ESPNOW] 发送状态: %s\n", status==ESP_NOW_SEND_SUCCESS?"OK":"FAIL");
-}
+inline void onEspNowSend(const uint8_t*, esp_now_send_status_t) {}
 
-// ===== 初始化 ESP-NOW =====
 inline bool EspnowMesh_Init() {
-    // WiFi 必须处于 STA 模式 (但不连接路由器), ESP-NOW 才能工作
     WiFi.mode(WIFI_STA);
-
-    // 设置信道为 ESPNOW_CHANNEL (必须所有设备一致)
+    WiFi.disconnect();
+    esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-
-    // 获取本机MAC
+    esp_wifi_set_promiscuous(false);
     WiFi.macAddress(myMac);
-    Serial.printf("[ESPNOW] 本机MAC: %02X:%02X:%02X:%02X:%02X:%02X 信道:%d 仓号:%d\n",
-                  myMac[0], myMac[1], myMac[2], myMac[3], myMac[4], myMac[5],
-                  ESPNOW_CHANNEL, myBinId);
 
-    // 初始化 ESP-NOW
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("[ESPNOW] 初始化失败!");
-        return false;
-    }
-
-    // 注册发送/接收回调
+    if (esp_now_init() != ESP_OK) return false;
     esp_now_register_send_cb(onEspNowSend);
     esp_now_register_recv_cb(onEspNowRecv);
 
-    // 添加广播对等体
-    esp_now_peer_info_t peer;
-    memset(&peer, 0, sizeof(peer));
-    memcpy(peer.peer_addr, BROADCAST_MAC, 6);
+    esp_now_peer_info_t peer{};
+    memcpy(peer.peer_addr, ESPNOW_BROADCAST_MAC, 6);
     peer.channel = ESPNOW_CHANNEL;
     peer.encrypt = false;
-    if (esp_now_add_peer(&peer) != ESP_OK) {
-        Serial.println("[ESPNOW] 添加广播对等体失败!");
-        return false;
+    if (!esp_now_is_peer_exist(ESPNOW_BROADCAST_MAC) && esp_now_add_peer(&peer) != ESP_OK) return false;
+
+    meshInitialized = true;
+    meshStartedMs = millis();
+    if (EspnowMesh_IsMaster()) {
+        followerLastAckMs[myBinId - 1] = meshStartedMs;
+        binStates[myBinId - 1].online = true;
     }
-
-    // 初始化本机仓状态: 自己在线, 通知Display
-    uint8_t myIdx = (myBinId >= 1 && myBinId <= BIN_COUNT) ? myBinId - 1 : 0;
-    binStates[myIdx].online = true;
-    binStates[myIdx].lastHeardMs = millis();
-    binStates[myIdx].binWeight = 0;
-    binStates[myIdx].currentWeight = 0;
-    memcpy(binStates[myIdx].mac, myMac, 6);
-    if (gOnBinStateCb) gOnBinStateCb(myBinId, true, 0, 0);
-
-    lastAnyRecvMs = millis();  // 初始化静默计时
-    isSilent = false;
-    Serial.println("[ESPNOW] 初始化完成 (广播模式, 无需路由器)");
+    Serial.printf("[ESPNOW] 初始化完成: 本机仓%d, 主机仓%d, epoch=%u, channel=%u\n",
+                  myBinId, selectedMasterBin, selectedMasterEpoch, ESPNOW_CHANNEL);
     return true;
 }
 
-// ===== 主循环调用: 定时发心跳 + 检测离线 + 全静默检测 =====
+inline void EspnowMesh_ProcessMasterSelection() {
+    if (!masterSelectionPending) return;
+    uint8_t masterBin;
+    uint32_t epoch;
+    portENTER_CRITICAL(&meshMux);
+    masterBin = pendingMasterBin;
+    epoch = pendingMasterEpoch;
+    masterSelectionPending = false;
+    portEXIT_CRITICAL(&meshMux);
+    if (masterBin < 1 || masterBin > BIN_COUNT || epoch < selectedMasterEpoch) return;
+    if (masterBin == selectedMasterBin && epoch == selectedMasterEpoch) return;
+    selectedMasterBin = masterBin;
+    selectedMasterEpoch = epoch;
+    Serial.printf("[ESPNOW] 主机配置更新: 仓%d, epoch=%u\n", masterBin, epoch);
+    if (gOnMasterSelectionCb) gOnMasterSelectionCb(masterBin, epoch);
+}
+
+inline void EspnowMesh_ProcessPendingUi() {
+    bool hasMask;
+    uint8_t mask;
+    float weight;
+    bool hasSync;
+    uint8_t syncBin;
+    float syncWeight;
+    portENTER_CRITICAL(&meshMux);
+    hasMask = onlineMaskPending;
+    mask = pendingOnlineMask;
+    weight = pendingOnlineWeight;
+    onlineMaskPending = false;
+    hasSync = binWeightSyncPending;
+    syncBin = pendingSyncBin;
+    syncWeight = pendingSyncWeight;
+    binWeightSyncPending = false;
+    portEXIT_CRITICAL(&meshMux);
+    if (hasMask) EspnowMesh_ApplyOnlineMask(mask, weight);
+    if (hasSync && syncBin >= 1 && syncBin <= BIN_COUNT) {
+        binStates[syncBin - 1].binWeight = syncWeight;
+        if (gOnBinWeightSyncCb) gOnBinWeightSyncCb(syncBin, syncWeight);
+    }
+}
+
+inline void EspnowMesh_SendPendingAck(uint32_t now) {
+    if (!ackPending || static_cast<int32_t>(now - ackDueMs) < 0) return;
+    uint32_t seq;
+    uint8_t repeatsLeft;
+    portENTER_CRITICAL(&meshMux);
+    seq = ackWeightSeq;
+    repeatsLeft = ackRepeatsRemaining;
+    if (repeatsLeft > 1) {
+        ackRepeatsRemaining = repeatsLeft - 1;
+        ackDueMs = now + 240U;
+        ackPending = true;
+    } else {
+        ackRepeatsRemaining = 0;
+        ackPending = false;
+    }
+    portEXIT_CRITICAL(&meshMux);
+    FollowerAckPacket pkt{};
+    pkt.magic = FOLLOWER_ACK_MAGIC;
+    pkt.version = ESPNOW_PROTOCOL_VERSION;
+    pkt.binId = myBinId;
+    pkt.masterBin = selectedMasterBin;
+    pkt.weightSeq = seq;
+    pkt.masterEpoch = selectedMasterEpoch;
+    esp_now_send(ESPNOW_BROADCAST_MAC, reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
+}
+
 inline void EspnowMesh_Loop(float myBinWeight, float myCurrentWeight) {
+    if (!meshInitialized) return;
     uint32_t now = millis();
+    EspnowMesh_ProcessMasterSelection();
+    EspnowMesh_ProcessPendingUi();
 
-    // 定时广播心跳 + 日志
-    if (gForceHeartbeatPending || now - lastHeartbeatSentMs >= HEARTBEAT_INTERVAL_MS) {
-        gForceHeartbeatPending = false;
-        lastHeartbeatSentMs = now;
-        EspnowMesh_BroadcastHeartbeat(myBinWeight, myCurrentWeight);
-        static uint32_t lastSendLogMs = 0;
-        if (now - lastSendLogMs > 5000) {
-            lastSendLogMs = now;
-            Serial.printf("[ESPNOW] 发: 仓%d seq=%u bw=%.1f cw=%.1f\n",
-                          myBinId, hbSeq, myBinWeight, myCurrentWeight);
+    if (EspnowMesh_IsMaster()) {
+        localNetWeight = localNetValid ? myCurrentWeight : 0.0f;
+        if (lastWeightBroadcastMs == 0 || now - lastWeightBroadcastMs >= WEIGHT_BROADCAST_INTERVAL_MS) {
+            lastWeightBroadcastMs = now;
+            EspnowMesh_BroadcastHeartbeat(myBinWeight, localNetWeight);
         }
-    }
-
-    // 租约持有者消失但没有来得及发断联包时，超时释放并启动新一轮抢连。
-    if (gRemoteBleConnected && now - gRemoteBleLastMs >= REMOTE_BLE_LEASE_MS) {
-        uint8_t expiredBin = gRemoteBleBin;
-        gRemoteBleConnected = false;
-        gRemoteBleLastMs = 0;
-        gRemoteBleBin = 0;
-        memset(gRemoteBleMac, 0, sizeof(gRemoteBleMac));
-        Serial.printf("[ESPNOW] 远程仓%d BLE称重租约超时，允许接管\n", expiredBin);
-        if (gOnRemoteBleCb) gOnRemoteBleCb(false, 0.0f);
-    }
-
-    // 检测其他仓离线
-    for (uint8_t i = 0; i < BIN_COUNT; ++i) {
-        uint8_t binId = i + 1;
-        if (binId == myBinId) continue;  // 跳过自己
-        if (!binStates[i].online) continue;
-        if (now - binStates[i].lastHeardMs > OFFLINE_TIMEOUT_MS) {
-            binStates[i].online = false;
-            Serial.printf("[ESPNOW] 仓%d 离线 (心跳超时)\n", binId);
-            if (gOnBinStateCb) gOnBinStateCb(binId, false, 0, 0);
+        if (silenceState) {
+            silenceState = false;
+            if (gOnSilenceCb) gOnSilenceCb(false);
         }
-    }
-
-    // 全静默检测: 超过 SILENCE_TIMEOUT_MS 没收到任何广播 → 断网
-    // (排除自己刚启动还没收到过的情况: lastAnyRecvMs==0 时不触发)
-    if (lastAnyRecvMs != 0) {
-        bool nowSilent = (now - lastAnyRecvMs > SILENCE_TIMEOUT_MS);
-        if (nowSilent != isSilent) {
-            isSilent = nowSilent;
-            Serial.printf("[ESPNOW] 全静默状态: %s\n", isSilent ? "断网(无任何广播)" : "恢复");
-            if (gOnSilenceCb) gOnSilenceCb(isSilent);
+    } else {
+        EspnowMesh_SendPendingAck(now);
+        bool silent = lastMasterFrameMs == 0
+            ? now - meshStartedMs >= MASTER_OFFLINE_TIMEOUT_MS
+            : now - lastMasterFrameMs >= MASTER_OFFLINE_TIMEOUT_MS;
+        if (silent != silenceState) {
+            silenceState = silent;
+            if (silent) {
+                remoteNetValid = false;
+                remoteNetWeight = 0.0f;
+                EspnowMesh_ApplyOnlineMask(0, 0.0f);
+            }
+            if (gOnSilenceCb) gOnSilenceCb(silent);
         }
     }
 }
 
-// ===== 查询某仓是否在线 =====
 inline bool EspnowMesh_IsBinOnline(uint8_t binId) {
-    if (binId < 1 || binId > BIN_COUNT) return false;
-    if (binId == myBinId) return true;  // 自己永远在线
-    return binStates[binId - 1].online;
+    return binId >= 1 && binId <= BIN_COUNT && binStates[binId - 1].online;
 }
 
-// ===== 获取某仓仓重 =====
 inline float EspnowMesh_GetBinWeight(uint8_t binId) {
-    if (binId < 1 || binId > BIN_COUNT) return 0;
-    return binStates[binId - 1].binWeight;
+    return (binId >= 1 && binId <= BIN_COUNT) ? binStates[binId - 1].binWeight : 0.0f;
 }
