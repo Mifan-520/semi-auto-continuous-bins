@@ -354,6 +354,11 @@ inline bool EspnowMesh_Init() {
     if (EspnowMesh_IsMaster()) {
         followerLastAckMs[myBinId - 1] = meshStartedMs;
         binStates[myBinId - 1].online = true;
+        binStates[myBinId - 1].lastHeardMs = meshStartedMs;
+        // 主机自己立即上线: 显式触发一次回调, 点亮本机对应的状态灯。
+        // (后续 ApplyOnlineMask 因状态未变化不会回调, 这里补一次。)
+        if (gOnBinStateCb)
+            gOnBinStateCb(myBinId, true, binStates[myBinId - 1].binWeight, 0.0f);
     }
     Serial.printf("[ESPNOW] 初始化完成: 本机仓%d, 主机仓%d, epoch=%u, channel=%u\n",
                   myBinId, selectedMasterBin, selectedMasterEpoch, ESPNOW_CHANNEL);

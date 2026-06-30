@@ -359,6 +359,7 @@ inline void showEditConfirmDialog(float newWeight) {
     lv_obj_set_size(editConfirmBox, 300, 160);
     lv_obj_center(editConfirmBox);
     lv_obj_set_style_bg_color(editConfirmBox, C(CLR_PANEL), 0);
+    lv_obj_set_style_bg_opa(editConfirmBox, LV_OPA_COVER, 0);  // 不透明白色背景
     lv_obj_set_style_border_width(editConfirmBox, 3, 0);
     lv_obj_set_style_border_color(editConfirmBox, C(CLR_ROASTEK), 0);
     lv_obj_set_style_radius(editConfirmBox, 12, 0);
@@ -603,6 +604,22 @@ inline void showDevBinDialog() {
     lv_obj_set_style_border_color(box, C(CLR_ROASTEK), 0);
     lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
 
+    // 右上角红色圆形关闭按钮 (×)
+    lv_obj_t* closeBtn = lv_btn_create(box);
+    lv_obj_set_size(closeBtn, 28, 28);
+    lv_obj_set_style_radius(closeBtn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(closeBtn, C(CLR_RED), 0);
+    lv_obj_set_style_border_width(closeBtn, 0, 0);
+    lv_obj_set_style_shadow_width(closeBtn, 0, 0);
+    lv_obj_set_style_pad_all(closeBtn, 0, 0);
+    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, -8, 8);
+    lv_obj_add_event_cb(closeBtn, modalCloseEvent, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* closeLbl = lv_label_create(closeBtn);
+    lv_label_set_text(closeLbl, "X");
+    lv_obj_set_style_text_font(closeLbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(closeLbl, lv_color_white(), 0);
+    lv_obj_center(closeLbl);
+
     lv_obj_t* titleLabel = makeLabel(box, "开发者模式", &lv_font_chinese_14, C(CLR_ROASTEK));
     lv_obj_align(titleLabel, LV_ALIGN_TOP_MID, 0, 8);
 
@@ -703,10 +720,10 @@ inline void displayFlush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t*
 inline void updateWeights() {
     char buf[32];
     // 仓重大数字
-    snprintf(buf, sizeof(buf), "%.1f", binWeights[localBin]);
+    snprintf(buf, sizeof(buf), "%.2f", binWeights[localBin]);
     lv_label_set_text(binWeightLabel, buf);
     // 称重重量(左1/4)
-    snprintf(buf, sizeof(buf), "%.1f", simCurrentWeight);
+    snprintf(buf, sizeof(buf), "%.2f", simCurrentWeight);
     lv_label_set_text(curWeightLabel, buf);
 }
 
